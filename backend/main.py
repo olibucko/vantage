@@ -8,6 +8,10 @@ import uvicorn
 
 # Internal module imports
 from active_scanner import scan_network, get_local_ip
+from passive_monitor import (
+    start_passive_monitoring, stop_passive_monitoring,
+    get_passive_discoveries, merge_with_active_scan
+)
 
 # --- Environment Setup ---
 DATA_DIR = os.path.abspath("../data")
@@ -79,9 +83,40 @@ async def heartbeat():
             await manager.broadcast({"type": "HEARTBEAT"})
         await asyncio.sleep(15)
 
+async def passive_discovery_broadcast():
+    """Periodically broadcast passive discoveries to connected clients"""
+    global node_cache
+    await asyncio.sleep(10)  # Wait for initial setup
+
+    while True:
+        passive_devices = get_passive_discoveries()
+        if passive_devices and manager.active_connections:
+            # Merge with existing cache
+            merged_nodes = merge_with_active_scan(node_cache)
+            node_cache = merged_nodes
+
+            # Save to disk
+            with open(DATA_FILE, "w") as f:
+                json.dump(merged_nodes, f, indent=4)
+
+            # Broadcast update
+            await manager.broadcast({
+                "type": "PASSIVE_UPDATE",
+                "nodes": merged_nodes,
+                "new_count": len(passive_devices)
+            })
+            print(f"Vantage: Broadcasted passive update ({len(passive_devices)} passive devices)")
+
+        await asyncio.sleep(30)  # Check every 30 seconds
+
 @app.on_event("startup")
 async def startup_event():
+    # Start background tasks
     asyncio.create_task(heartbeat())
+    asyncio.create_task(passive_discovery_broadcast())
+
+    # Start passive ARP monitoring
+    start_passive_monitoring()
 
 # --- REST Endpoints ---
 
@@ -103,14 +138,17 @@ async def trigger_scan():
         loop = asyncio.get_event_loop()
         # Offload the synchronous Scapy scan to a thread pool
         nodes = await loop.run_in_executor(None, scan_network, subnet)
-        
-        node_cache = nodes
+
+        # Merge with passive discoveries
+        merged_nodes = merge_with_active_scan(nodes)
+
+        node_cache = merged_nodes
         with open(DATA_FILE, "w") as f:
-            json.dump(nodes, f, indent=4)
-            
-        await manager.broadcast({"type": "SCAN_COMPLETE", "nodes": nodes})
-        print(f"Vantage: Scan complete. Identified {len(nodes)} nodes.")
-        return {"status": "success", "count": len(nodes)}
+            json.dump(merged_nodes, f, indent=4)
+
+        await manager.broadcast({"type": "SCAN_COMPLETE", "nodes": merged_nodes})
+        print(f"Vantage: Scan complete. Identified {len(merged_nodes)} nodes ({len(nodes)} active + passive).")
+        return {"status": "success", "count": len(merged_nodes), "active": len(nodes)}
     except Exception as e:
         print(f"Vantage Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -1,3 +1,9 @@
+export interface Service {
+  port: number;
+  name: string;
+  banner?: string | null;
+}
+
 export interface NetworkNode {
   ip: string;
   mac: string;
@@ -6,6 +12,10 @@ export interface NetworkNode {
   os: string;
   type: string;
   ports: number[];
+  services?: Service[];
+  deviceName?: string | null;
+  confidence?: number;
+  lastSeen?: number;
 }
 
 export interface GraphNode extends NetworkNode {

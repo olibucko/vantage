@@ -8,7 +8,9 @@ function App() {
   const [selectedNode, setSelectedNode] = useState<NetworkNode | null>(null);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState<string>('All');
+  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const ws = useRef<WebSocket | null>(null);
+  const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const loadCache = async () => {
@@ -25,16 +27,58 @@ function App() {
 
   useEffect(() => {
     function connect() {
+      console.log("Vantage: Initiating WebSocket connection...");
+      setWsStatus('connecting');
+
       const socket = new WebSocket('ws://localhost:8001/ws');
+
+      socket.onopen = () => {
+        console.log("Vantage: WebSocket connected!");
+        setWsStatus('connected');
+        if (reconnectTimeout.current) {
+          clearTimeout(reconnectTimeout.current);
+          reconnectTimeout.current = null;
+        }
+      };
+
       socket.onmessage = (e) => {
         const d = JSON.parse(e.data);
-        if (d.type === 'SCAN_COMPLETE') { setNodes(d.nodes); setLoading(false); }
+        console.log("Vantage: Received message:", d.type);
+
+        if (d.type === 'SCAN_COMPLETE') {
+          console.log(`Vantage: Scan complete - ${d.nodes.length} devices`);
+          setNodes(d.nodes);
+          setLoading(false);
+        } else if (d.type === 'PASSIVE_UPDATE') {
+          console.log(`Vantage: Passive update - ${d.new_count} new device(s), total ${d.nodes.length} nodes`);
+          setNodes(d.nodes);
+        } else if (d.type === 'HEARTBEAT') {
+          console.log("Vantage: Heartbeat received");
+        }
       };
-      socket.onclose = () => setTimeout(connect, 3000);
+
+      socket.onerror = (error) => {
+        console.error("Vantage: WebSocket error:", error);
+        setWsStatus('disconnected');
+      };
+
+      socket.onclose = () => {
+        console.log("Vantage: WebSocket disconnected, reconnecting in 3s...");
+        setWsStatus('disconnected');
+        reconnectTimeout.current = setTimeout(connect, 3000);
+      };
+
       ws.current = socket;
     }
+
     connect();
-    return () => ws.current?.close();
+
+    return () => {
+      if (reconnectTimeout.current) {
+        clearTimeout(reconnectTimeout.current);
+      }
+      ws.current?.close();
+    };
   }, []);
 
   const triggerScan = () => { setLoading(true); fetch('http://localhost:8001/scan'); };
@@ -43,6 +87,43 @@ function App() {
   const handleNodeInteraction = (node: NetworkNode, event: MouseEvent) => {
     event.preventDefault();
     setSelectedNode(node);
+  };
+
+  // Generate display name: Device Type (Vendor) or fallback to IP
+  const getDisplayName = (node: NetworkNode): string => {
+    const type = node.type;
+    const vendor = node.vendor;
+
+    // If we have a friendly mDNS name, use it
+    if (node.deviceName && node.deviceName !== "Unknown") {
+      return node.deviceName;
+    }
+
+    // Priority: "Device Type" if specific, otherwise fallback hierarchy
+    if (type && type !== "Unknown Device" && type !== "Generic Device") {
+      // If type already contains vendor (e.g., "TP-Link Router"), use as-is
+      if (vendor !== "Unknown" && type.includes(vendor)) {
+        return type;
+      }
+      // Otherwise combine: "Device Type (Vendor)"
+      if (vendor !== "Unknown") {
+        return `${type} (${vendor})`;
+      }
+      // Just type
+      return type;
+    }
+
+    // Fallback: Vendor Device
+    if (vendor !== "Unknown") {
+      return `${vendor} Device`;
+    }
+
+    // Last resort: hostname or IP
+    if (node.hostname && node.hostname !== "Unknown") {
+      return node.hostname;
+    }
+
+    return node.ip;
   };
 
   const graphData = useMemo(() => {
@@ -59,7 +140,9 @@ function App() {
     };
 
     const d3Nodes = filtered.map(n => ({
-      ...n, id: n.ip, name: n.hostname !== "Unknown" ? n.hostname : n.ip, 
+      ...n,
+      id: n.ip,
+      name: getDisplayName(n),
       val: n.ip === gateway.ip ? 6 : 3,
       color: n.ip === gateway.ip ? '#3b82f6' : (n.os === 'Windows' ? '#0ea5e9' : '#f59e0b')
     }));
@@ -138,6 +221,20 @@ function App() {
             />
           </div>
         )}
+
+        {/* Connection Status Overlay */}
+        {wsStatus === 'connecting' && (
+          <div className="absolute inset-0 pointer-events-none -z-5">
+            <div className="absolute inset-0 bg-gradient-to-b from-transparent via-yellow-500/5 to-transparent animate-pulse" />
+            <div className="absolute inset-0 border-2 border-yellow-500/10 animate-pulse" />
+          </div>
+        )}
+        {wsStatus === 'disconnected' && (
+          <div className="absolute inset-0 pointer-events-none -z-5">
+            <div className="absolute inset-0 bg-gradient-to-b from-transparent via-red-500/5 to-transparent animate-pulse" />
+            <div className="absolute inset-0 border-2 border-red-500/20 animate-pulse" />
+          </div>
+        )}
         
         <GraphView data={graphData} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} />
         
@@ -174,6 +271,32 @@ function App() {
 
             {/* Content Grid */}
             <div className="p-6 space-y-4">
+              {/* Detection Confidence & Device Name */}
+              {(selectedNode.confidence !== undefined || selectedNode.deviceName) && (
+                <div className="flex gap-4">
+                  {selectedNode.confidence !== undefined && (
+                    <div className="flex-1 p-4 bg-gradient-to-r from-green-600/10 to-emerald-600/10 rounded-xl border border-green-500/20">
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-green-400 mb-2">Detection Confidence</p>
+                      <div className="flex items-center gap-3">
+                        <div className="flex-1 h-2 bg-white/10 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-gradient-to-r from-green-500 to-emerald-500 rounded-full transition-all"
+                            style={{width: `${selectedNode.confidence}%`}}
+                          />
+                        </div>
+                        <span className="text-2xl font-black text-white">{selectedNode.confidence}%</span>
+                      </div>
+                    </div>
+                  )}
+                  {selectedNode.deviceName && (
+                    <div className="flex-1 p-4 bg-purple-600/10 rounded-xl border border-purple-500/20">
+                      <p className="text-[10px] font-bold uppercase tracking-widest text-purple-400 mb-1">mDNS Name</p>
+                      <p className="text-base font-bold text-white">{selectedNode.deviceName}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Network Information */}
               <div className="space-y-3">
                 <h3 className="text-xs font-black uppercase tracking-widest text-blue-400 flex items-center gap-2">
@@ -212,12 +335,33 @@ function App() {
                 </div>
               </div>
 
-              {/* Port Information */}
+              {/* Services & Ports Information */}
               <div className="space-y-3">
                 <h3 className="text-xs font-black uppercase tracking-widest text-blue-400 flex items-center gap-2">
-                  <HardDrive className="w-4 h-4" /> Open Ports
+                  <HardDrive className="w-4 h-4" /> Detected Services
                 </h3>
-                {selectedNode.ports.length > 0 ? (
+                {selectedNode.services && selectedNode.services.length > 0 ? (
+                  <div className="space-y-2">
+                    {selectedNode.services.map((service, idx) => (
+                      <div key={idx} className="p-3 bg-gradient-to-r from-orange-600/10 to-red-600/10 rounded-lg border border-orange-500/20">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-1">
+                              <Unlock className="w-3 h-3 text-orange-400" />
+                              <span className="text-sm font-black text-white">{service.name}</span>
+                              <span className="text-xs font-mono text-neutral-400">Port {service.port}</span>
+                            </div>
+                            {service.banner && (
+                              <p className="text-[10px] font-mono text-neutral-400 mt-1 truncate">
+                                {service.banner}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : selectedNode.ports.length > 0 ? (
                   <div className="grid grid-cols-4 gap-2">
                     {selectedNode.ports.map(port => (
                       <div key={port} className="p-3 bg-gradient-to-br from-red-600/20 to-orange-600/20 rounded-lg border border-red-500/30 text-center">
@@ -262,7 +406,27 @@ function App() {
       <footer className="px-10 py-4 border-t border-white/20 bg-black/80 backdrop-blur-xl text-[10px] font-mono text-neutral-600 flex justify-between items-center shrink-0">
         <div className="flex items-center gap-8">
           <span className="uppercase tracking-[0.4em] font-bold">Vantage v1.2.8</span>
-          <span className="flex items-center gap-2 font-black text-green-500/50 uppercase"><Activity className="w-3.5 h-3.5" /> Engine_Nominal</span>
+
+          {/* Connection Status Indicator */}
+          {wsStatus === 'connected' && (
+            <span className="flex items-center gap-2 font-black text-green-500/70 uppercase">
+              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse shadow-[0_0_10px_#22c55e]" />
+              Link_Established
+            </span>
+          )}
+          {wsStatus === 'connecting' && (
+            <span className="flex items-center gap-2 font-black text-yellow-500/70 uppercase">
+              <div className="w-2 h-2 rounded-full bg-yellow-500 animate-ping shadow-[0_0_10px_#eab308]" />
+              Establishing_Link
+            </span>
+          )}
+          {wsStatus === 'disconnected' && (
+            <span className="flex items-center gap-2 font-black text-red-500/70 uppercase">
+              <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse shadow-[0_0_10px_#ef4444]" />
+              Link_Severed
+            </span>
+          )}
+
           <div className="flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse shadow-[0_0_10px_#3b82f6]" />
             <span className="uppercase tracking-wider font-bold text-blue-500/70">{nodes.length} Nodes Discovered</span>
