@@ -60,8 +60,10 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
           // Drawn on the gateway node's canvas pass so it sits behind all other
           // nodes (gateway is first in the nodes array, so it renders first).
           if (g.ip === gatewayId) {
-            // Adaptive radius: max distance from gateway to any peer + padding
-            let maxDist = 80;
+            // Adaptive radius: max distance from gateway to any peer + padding.
+            // Node draw radius = 5 graph units, so +14 leaves ~9 units of gap
+            // between the outermost node edge and the ring — tight but legible.
+            let maxDist = 50;
             data.nodes.forEach((n: GraphNode) => {
               if (n.id !== gatewayId && n.x != null && n.y != null) {
                 const dx = (n.x ?? 0) - x;
@@ -69,7 +71,7 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
                 maxDist = Math.max(maxDist, Math.sqrt(dx * dx + dy * dy));
               }
             });
-            const ringRadius = maxDist + 40;
+            const ringRadius = maxDist + 14;
 
             ctx.save();
 
