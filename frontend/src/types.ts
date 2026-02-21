@@ -38,3 +38,10 @@ export interface GraphData {
   nodes: GraphNode[];
   links: GraphLink[];
 }
+
+export type AnimPhase = 'spawn' | 'despawn';
+
+export interface AnimEntry {
+  type: AnimPhase;
+  startTime: number; // performance.now() timestamp
+}

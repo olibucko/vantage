@@ -1,4 +1,4 @@
-from scapy.all import ARP, sniff
+from scapy.all import ARP, Ether, sniff, sendp
 import threading
 import time
 from vendor_lookup import get_vendor
@@ -9,6 +9,61 @@ discovered_devices = {}
 devices_lock = threading.Lock()
 monitoring_active = False
 monitor_thread = None
+
+# Connect callback (set by main.py to fire DEVICE_CONNECTED events)
+_on_connect_callback = None
+
+def set_on_connect_callback(callback):
+    global _on_connect_callback
+    _on_connect_callback = callback
+
+def get_stale_devices(threshold_seconds: int) -> list:
+    """Return copies of devices not seen within threshold_seconds."""
+    now = int(time.time())
+    stale = []
+    with devices_lock:
+        for ip, device in discovered_devices.items():
+            last = device.get('lastSeen', device.get('discovered_at', now))
+            if (now - last) > threshold_seconds:
+                stale.append(device.copy())
+    return stale
+
+def remove_device(ip: str):
+    """Remove a device from the discovered_devices cache."""
+    with devices_lock:
+        if ip in discovered_devices:
+            del discovered_devices[ip]
+
+def probe_known_devices():
+    """Send an ARP who-has request to every tracked device.
+    Online devices reply; the passive sniffer captures the reply and
+    refreshes lastSeen. Offline devices stay silent → go stale.
+    """
+    with devices_lock:
+        targets = [(ip, dev.get('mac', '')) for ip, dev in discovered_devices.items()]
+
+    for ip, mac in targets:
+        try:
+            # Unicast to the known MAC when available, broadcast otherwise
+            dst = mac if mac else 'ff:ff:ff:ff:ff:ff'
+            sendp(Ether(dst=dst) / ARP(op=1, pdst=ip), verbose=0)
+        except Exception:
+            pass
+
+def preload_from_cache(cache_nodes: list):
+    """Seed discovered_devices from persisted node_cache on startup.
+    This ensures the stale checker can evict devices that go offline
+    even if they never sent an ARP packet in the current session.
+    """
+    now = int(time.time())
+    count = 0
+    with devices_lock:
+        for node in cache_nodes:
+            ip = node.get('ip')
+            if ip and ip not in discovered_devices:
+                discovered_devices[ip] = {**node, 'lastSeen': now}
+                count += 1
+    print(f"Vantage: Preloaded {count} cached nodes into passive monitor.")
 
 def passive_arp_callback(packet):
     """Callback for each ARP packet detected"""
@@ -21,34 +76,52 @@ def passive_arp_callback(packet):
             mac = arp.hwsrc
 
             if ip and mac and ip != "0.0.0.0":
+                is_new = False
+                snapshot = None
+
                 with devices_lock:
+                    now = int(time.time())
                     if ip not in discovered_devices:
+                        is_new = True
                         print(f"Vantage: New device detected via passive monitoring: {ip} ({mac})")
 
-                        # Quick device info gathering
                         vendor = get_vendor(mac)
                         device_info = {
                             'ip': ip,
                             'mac': mac,
                             'vendor': vendor,
                             'hostname': 'Discovering...',
-                            'discovered_at': int(time.time()),
-                            'method': 'passive_arp'
+                            'discovered_at': now,
+                            'lastSeen': now,
+                            'method': 'passive_arp',
+                            'os': 'Unknown',
+                            'type': 'Unknown Device',
+                            'ports': [],
+                            'services': [],
+                            'confidence': 0,
+                            'deviceName': None
                         }
-
                         discovered_devices[ip] = device_info
+                        snapshot = device_info.copy()
+                    else:
+                        discovered_devices[ip]['lastSeen'] = now
 
-                        # Trigger deep interrogation in background
-                        threading.Thread(
-                            target=interrogate_new_device,
-                            args=(ip, mac, vendor),
-                            daemon=True
-                        ).start()
+                # Fire callback and start interrogation outside the lock
+                if is_new:
+                    if _on_connect_callback:
+                        try:
+                            _on_connect_callback(snapshot)
+                        except Exception as e:
+                            print(f"Vantage: on_connect_callback error: {e}")
+                    threading.Thread(
+                        target=interrogate_new_device,
+                        args=(ip, mac, get_vendor(mac)),
+                        daemon=True
+                    ).start()
 
 def interrogate_new_device(ip, mac, vendor):
     """Deep interrogation for passively discovered device"""
     try:
-        import socket
         info, hostname = deep_interrogate(ip, vendor, mac)
 
         with devices_lock:

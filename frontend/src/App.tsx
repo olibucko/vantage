@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import GraphView from './GraphView';
 import { Shield, RefreshCw, Activity, X, Wifi, Monitor, Cpu, HardDrive, Lock, Unlock } from 'lucide-react';
-import type { NetworkNode } from './types';
+import type { NetworkNode, AnimEntry } from './types';
 
 function App() {
   const [nodes, setNodes] = useState<NetworkNode[]>([]);
@@ -11,13 +11,30 @@ function App() {
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const ws = useRef<WebSocket | null>(null);
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const animStateRef = useRef<Map<string, AnimEntry>>(new Map());
+  // Mirror of `nodes` state for synchronous reads inside WS callbacks (avoids stale closures)
+  const nodesRef = useRef<NetworkNode[]>([]);
 
   useEffect(() => {
     const loadCache = async () => {
       try {
         const res = await fetch('http://localhost:8001/nodes');
         const data = await res.json();
-        if (data.nodes) setNodes(data.nodes);
+        if (data.nodes) {
+          const cached: NetworkNode[] = data.nodes;
+          const now = performance.now();
+          // Stagger spawn animations so cached nodes materialise one-by-one
+          cached.forEach((node, i) => {
+            animStateRef.current.set(node.ip, { type: 'spawn', startTime: now + i * 80 });
+            // Clean up spawn entry once animation completes so links return to idle grey
+            setTimeout(() => {
+              if (animStateRef.current.get(node.ip)?.type === 'spawn')
+                animStateRef.current.delete(node.ip);
+            }, 950 + i * 80);
+          });
+          nodesRef.current = cached;
+          setNodes(cached);
+        }
       } catch {
         console.error("Vantage: Link Offline");
       }
@@ -46,14 +63,87 @@ function App() {
         console.log("Vantage: Received message:", d.type);
 
         if (d.type === 'SCAN_COMPLETE') {
-          console.log(`Vantage: Scan complete - ${d.nodes.length} devices`);
-          setNodes(d.nodes);
+          const scanNodes: NetworkNode[] = d.nodes;
+          const scanIpSet = new Set(scanNodes.map((n: NetworkNode) => n.ip));
+          const prev = nodesRef.current;
+          const now = performance.now();
+
+          // Nodes that disappeared → despawn animation
+          const removedIps = prev.filter(n => !scanIpSet.has(n.ip)).map(n => n.ip);
+          // Nodes that are new → spawn animation
+          const prevIpSet = new Set(prev.map(n => n.ip));
+          const addedIps = scanNodes.filter((n: NetworkNode) => !prevIpSet.has(n.ip)).map(n => n.ip);
+
+          animStateRef.current.clear();
+          removedIps.forEach(ip => animStateRef.current.set(ip, { type: 'despawn', startTime: now }));
+          addedIps.forEach(ip => animStateRef.current.set(ip, { type: 'spawn', startTime: now }));
+
+          // Keep removed nodes in the list temporarily so despawn animation plays
+          const mergedMap = new Map(prev.map(n => [n.ip, n]));
+          scanNodes.forEach((n: NetworkNode) => mergedMap.set(n.ip, n));
+          const merged = Array.from(mergedMap.values());
+          nodesRef.current = merged;
+          setNodes(merged);
+
+          // After despawn animation finishes, remove the stale nodes
+          if (removedIps.length > 0) {
+            const removedSet = new Set(removedIps);
+            setTimeout(() => {
+              nodesRef.current = nodesRef.current.filter(n => !removedSet.has(n.ip));
+              setNodes([...nodesRef.current]);
+              removedIps.forEach(ip => animStateRef.current.delete(ip));
+            }, 900);
+          }
+          // Clean up spawn entries after animation completes
+          addedIps.forEach(ip => {
+            setTimeout(() => {
+              if (animStateRef.current.get(ip)?.type === 'spawn') animStateRef.current.delete(ip);
+            }, 950);
+          });
+
+          console.log(`Vantage: Scan complete — ${scanNodes.length} live, ${removedIps.length} removed, ${addedIps.length} new`);
           setLoading(false);
+
         } else if (d.type === 'PASSIVE_UPDATE') {
-          console.log(`Vantage: Passive update - ${d.new_count} new device(s), total ${d.nodes.length} nodes`);
-          setNodes(d.nodes);
+          // Only add genuinely new IPs — never update existing nodes here.
+          // Updating existing nodes would rebuild graphData and reheat the force simulation, causing jitter.
+          const existingIps = new Set(nodesRef.current.map(n => n.ip));
+          const newNodes = (d.nodes as NetworkNode[]).filter(n => {
+            const anim = animStateRef.current.get(n.ip);
+            return !existingIps.has(n.ip) && anim?.type !== 'despawn';
+          });
+          if (newNodes.length > 0) {
+            nodesRef.current = [...nodesRef.current, ...newNodes];
+            setNodes([...nodesRef.current]);
+          }
+          console.log(`Vantage: Passive update — ${newNodes.length} new node(s) added`);
+
+        } else if (d.type === 'DEVICE_CONNECTED') {
+          const newNode: NetworkNode = d.node;
+          // Skip if already visible (e.g. preloaded from cache on startup)
+          if (!nodesRef.current.some(n => n.ip === newNode.ip)) {
+            animStateRef.current.set(newNode.ip, { type: 'spawn', startTime: performance.now() });
+            setTimeout(() => {
+              if (animStateRef.current.get(newNode.ip)?.type === 'spawn')
+                animStateRef.current.delete(newNode.ip);
+            }, 950);
+            nodesRef.current = [...nodesRef.current, newNode];
+            setNodes([...nodesRef.current]);
+            console.log(`Vantage: Device connected — ${newNode.ip}`);
+          }
+
+        } else if (d.type === 'DEVICE_DISCONNECTED') {
+          const ip: string = d.ip;
+          console.log(`Vantage: Device disconnected — ${ip}`);
+          animStateRef.current.set(ip, { type: 'despawn', startTime: performance.now() });
+          setTimeout(() => {
+            nodesRef.current = nodesRef.current.filter(n => n.ip !== ip);
+            setNodes([...nodesRef.current]);
+            animStateRef.current.delete(ip);
+          }, 900);
+
         } else if (d.type === 'HEARTBEAT') {
-          console.log("Vantage: Heartbeat received");
+          // silent
         }
       };
 
@@ -236,7 +326,7 @@ function App() {
           </div>
         )}
         
-        <GraphView data={graphData} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} />
+        <GraphView data={graphData} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} animStateRef={animStateRef} />
         
         {/* Tactical Legend [cite: 2026-02-20] */}
         <div className="absolute top-10 left-10 p-6 bg-black/80 border border-white/25 rounded-2xl backdrop-blur-2xl flex flex-col gap-4 pointer-events-none z-20 shadow-2xl">

@@ -10,7 +10,10 @@ import uvicorn
 from active_scanner import scan_network, get_local_ip
 from passive_monitor import (
     start_passive_monitoring, stop_passive_monitoring,
-    get_passive_discoveries, merge_with_active_scan
+    get_passive_discoveries, merge_with_active_scan,
+    clear_passive_discoveries, set_on_connect_callback,
+    get_stale_devices, remove_device, preload_from_cache,
+    probe_known_devices
 )
 
 # --- Environment Setup ---
@@ -34,6 +37,11 @@ app.add_middleware(
 # --- Global State & Cache ---
 node_cache = []
 
+# Devices not seen within this window are considered disconnected.
+# Active ARP probing (every 10 s) keeps lastSeen fresh for online devices,
+# so this threshold reliably catches disconnects in ~25-35 s.
+STALE_THRESHOLD_SECONDS = 25
+
 def load_cache():
     global node_cache
     if os.path.exists(DATA_FILE):
@@ -46,6 +54,7 @@ def load_cache():
             node_cache = []
 
 load_cache()
+preload_from_cache(node_cache)  # Seed passive monitor so stale checker can track cached devices
 
 # --- WebSocket Manager ---
 class ConnectionManager:
@@ -75,7 +84,8 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# --- Heartbeat Task ---
+# --- Background Tasks ---
+
 async def heartbeat():
     """Keeps WebSocket connections alive by sending a periodic pulse."""
     while True:
@@ -109,13 +119,61 @@ async def passive_discovery_broadcast():
 
         await asyncio.sleep(30)  # Check every 30 seconds
 
+async def broadcast_device_connected(device_info: dict):
+    """Merge a newly discovered device into cache and notify all clients."""
+    global node_cache
+    ip = device_info.get('ip')
+    if ip and not any(n.get('ip') == ip for n in node_cache):
+        node_cache.append(device_info)
+    if manager.active_connections:
+        await manager.broadcast({"type": "DEVICE_CONNECTED", "node": device_info})
+        print(f"Vantage: Broadcasted DEVICE_CONNECTED for {ip}")
+
+async def stale_device_checker():
+    """Periodically evict devices that haven't been seen recently."""
+    global node_cache
+    await asyncio.sleep(35)  # Startup grace period — longer than STALE_THRESHOLD_SECONDS
+    while True:
+        stale = get_stale_devices(STALE_THRESHOLD_SECONDS)
+        for device in stale:
+            ip = device.get('ip')
+            if not ip:
+                continue
+            print(f"Vantage: {ip} stale — broadcasting DEVICE_DISCONNECTED")
+            await manager.broadcast({"type": "DEVICE_DISCONNECTED", "ip": ip})
+            remove_device(ip)
+            node_cache = [n for n in node_cache if n.get('ip') != ip]
+        if stale:
+            with open(DATA_FILE, "w") as f:
+                json.dump(node_cache, f, indent=4)
+        await asyncio.sleep(10)
+
+async def device_keepalive():
+    """Probe all tracked devices every 10 s with an ARP who-has request.
+    Online devices reply; the passive sniffer refreshes their lastSeen.
+    Devices that go offline stop responding and become stale within STALE_THRESHOLD_SECONDS.
+    """
+    await asyncio.sleep(20)  # Let passive monitor start up first
+    while True:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, probe_known_devices)
+        await asyncio.sleep(10)
+
 @app.on_event("startup")
 async def startup_event():
-    # Start background tasks
+    loop = asyncio.get_running_loop()
+
+    # Bridge the sync passive_monitor callback into the async event loop
+    def on_device_connected(device_info: dict):
+        asyncio.run_coroutine_threadsafe(broadcast_device_connected(device_info), loop)
+
+    set_on_connect_callback(on_device_connected)
+
     asyncio.create_task(heartbeat())
     asyncio.create_task(passive_discovery_broadcast())
+    asyncio.create_task(stale_device_checker())
+    asyncio.create_task(device_keepalive())
 
-    # Start passive ARP monitoring
     start_passive_monitoring()
 
 # --- REST Endpoints ---
@@ -131,9 +189,9 @@ async def trigger_scan():
     global node_cache
     local_ip = get_local_ip()
     subnet = ".".join(local_ip.split('.')[:-1]) + ".0/24"
-    
+
     print(f"Vantage: Initiating active interrogation on {subnet}...")
-    
+
     try:
         loop = asyncio.get_event_loop()
         # Offload the synchronous Scapy scan to a thread pool
@@ -141,6 +199,10 @@ async def trigger_scan():
 
         # Merge with passive discoveries
         merged_nodes = merge_with_active_scan(nodes)
+
+        # Refresh lastSeen for all active scan results so the stale checker
+        # doesn't evict devices that were just confirmed online by the scan
+        preload_from_cache(merged_nodes)
 
         node_cache = merged_nodes
         with open(DATA_FILE, "w") as f:
