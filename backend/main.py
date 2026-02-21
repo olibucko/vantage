@@ -1,8 +1,10 @@
 import os
+import sys
 import json
 import asyncio
+from contextlib import asynccontextmanager
 from typing import List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -17,14 +19,47 @@ from passive_monitor import (
 )
 
 # --- Environment Setup ---
-DATA_DIR = os.path.abspath("../data")
-DATA_FILE = os.path.join(DATA_DIR, "nodes.json")
+DATA_DIR    = os.path.abspath("../data")
+DATA_FILE   = os.path.join(DATA_DIR, "nodes.json")
+ALIASES_FILE = os.path.join(DATA_DIR, "aliases.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
     print(f"Vantage: Created data directory at {DATA_DIR}")
 
-app = FastAPI(title="Vantage API - Synoptic Engine")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan: replaces the deprecated @app.on_event('startup') pattern."""
+    global setup_errors
+    setup_errors = check_setup()
+    for err in setup_errors:
+        print(f"Vantage: ⚠  Setup issue: {err}")
+
+    loop = asyncio.get_running_loop()
+
+    # Bridge sync passive_monitor callbacks into the async event loop
+    def on_device_connected(device_info: dict):
+        asyncio.run_coroutine_threadsafe(broadcast_device_connected(device_info), loop)
+
+    def on_device_updated(device_info: dict):
+        asyncio.run_coroutine_threadsafe(broadcast_device_updated(device_info), loop)
+
+    set_on_connect_callback(on_device_connected)
+    set_on_update_callback(on_device_updated)
+
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(passive_discovery_broadcast())
+    asyncio.create_task(stale_device_checker())
+    asyncio.create_task(device_keepalive())
+    asyncio.create_task(startup_scan())       # Full scan ~5 s after boot
+    asyncio.create_task(periodic_discovery()) # Repeat every PERIODIC_SCAN_INTERVAL
+
+    start_passive_monitoring()
+    yield
+    stop_passive_monitoring()
+
+app = FastAPI(title="Vantage API - Synoptic Engine", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +70,10 @@ app.add_middleware(
 )
 
 # --- Global State & Cache ---
-node_cache = []
+node_cache     = []
+aliases        = {}   # MAC (lowercase) → user-defined alias name
+device_history = {}   # MAC (lowercase) → Unix timestamp of first sighting
+setup_errors   = []   # Populated at startup if prerequisites are missing
 
 # True while a full network scan is running — prevents concurrent scans and
 # lets newly-connected WebSocket clients know they should show a loading state.
@@ -49,32 +87,111 @@ STALE_THRESHOLD_SECONDS = 25
 # How long between automatic periodic re-scans (seconds).
 PERIODIC_SCAN_INTERVAL = 300  # 5 minutes
 
+# --- Persistence Helpers ---
+
+def _write_json_sync(path: str, data) -> None:
+    """Synchronous JSON write — always called via run_in_executor."""
+    with open(path, "w") as f:
+        json.dump(data, f, indent=4)
+
+async def _save_json_async(path: str, data) -> None:
+    """Non-blocking JSON persist — runs in the thread-pool so the event loop stays free."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _write_json_sync, path, data)
+
+# Convenience shorthands used throughout the module
+async def _save_cache_async(data: list)  -> None: await _save_json_async(DATA_FILE,   data)
+async def _save_aliases_async()          -> None: await _save_json_async(ALIASES_FILE, aliases)
+async def _save_history_async()          -> None: await _save_json_async(HISTORY_FILE, device_history)
+
+# --- Data Loaders ---
+
 def load_cache():
     global node_cache
     if os.path.exists(DATA_FILE):
         try:
-            with open(DATA_FILE, "r") as f:
+            with open(DATA_FILE) as f:
                 node_cache = json.load(f)
                 print(f"Vantage: Loaded {len(node_cache)} nodes from cache.")
         except Exception as e:
             print(f"Vantage: Failed to load cache: {e}")
             node_cache = []
 
+def load_aliases():
+    global aliases
+    if os.path.exists(ALIASES_FILE):
+        try:
+            with open(ALIASES_FILE) as f:
+                aliases = json.load(f)
+            print(f"Vantage: Loaded {len(aliases)} alias(es).")
+        except Exception as e:
+            print(f"Vantage: Failed to load aliases: {e}")
+
+def load_history():
+    global device_history
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE) as f:
+                device_history = json.load(f)
+            print(f"Vantage: Loaded first-seen history for {len(device_history)} device(s).")
+        except Exception as e:
+            print(f"Vantage: Failed to load device history: {e}")
+
 load_cache()
+load_aliases()
+load_history()
 preload_from_cache(node_cache)  # Seed passive monitor so stale checker can track cached devices
 node_cache = []                 # Don't serve stale cache to the frontend — startup scan populates it
 
-# --- Cache Persistence Helpers ---
+# --- Setup Checker ---
 
-def _write_cache_sync(data: list):
-    """Synchronous disk write — always called via run_in_executor, never directly from the event loop."""
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+def check_setup() -> list:
+    """Verify runtime prerequisites. Returns a list of human-readable error strings."""
+    errors = []
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            if not ctypes.windll.shell32.IsUserAnAdmin():
+                errors.append(
+                    "Administrator privileges are required for raw packet capture. "
+                    "Right-click your terminal and choose 'Run as Administrator'."
+                )
+        else:
+            if os.geteuid() != 0:
+                errors.append(
+                    "Root privileges are required for raw packet capture. "
+                    "Run Vantage with: sudo python main.py"
+                )
+    except Exception:
+        pass
 
-async def _save_cache_async(data: list):
-    """Persist node_cache to disk without blocking the event loop."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _write_cache_sync, data)
+    if sys.platform == "win32":
+        if not os.path.isdir(r"C:\Windows\System32\Npcap"):
+            errors.append(
+                "Npcap is not installed. Vantage requires Npcap for packet capture on Windows. "
+                "Download it from https://npcap.com"
+            )
+    return errors
+
+# --- First-Seen Injection ---
+
+def inject_first_seen(nodes: list) -> bool:
+    """Stamp each node with its firstSeen Unix timestamp from device_history.
+    Records new MACs at the current time. Returns True if new MACs were added
+    (caller should persist history to disk).
+    """
+    import time
+    now = int(time.time())
+    new_macs = False
+    for node in nodes:
+        mac = (node.get("mac") or "").lower().strip()
+        if not mac or mac == "00:00:00:00:00:00":
+            continue
+        if mac not in device_history:
+            device_history[mac] = now
+            new_macs = True
+        node["firstSeen"] = device_history[mac]
+    return new_macs
 
 # --- WebSocket Manager ---
 class ConnectionManager:
@@ -135,6 +252,10 @@ async def run_scan(mdns_duration: int = 30) -> bool:
         # Refresh lastSeen so stale checker doesn't evict devices just confirmed online
         await loop.run_in_executor(None, preload_from_cache, merged_nodes)
         node_cache = merged_nodes
+
+        # Stamp each node with its first-ever sighting time and persist if new MACs appeared
+        if inject_first_seen(merged_nodes):
+            await _save_history_async()
 
         await _save_cache_async(merged_nodes)
 
@@ -215,6 +336,8 @@ async def broadcast_device_connected(device_info: dict):
     """Merge a newly discovered device into cache and notify all clients."""
     global node_cache
     ip = device_info.get('ip')
+    if inject_first_seen([device_info]):
+        await _save_history_async()
     if ip and not any(n.get('ip') == ip for n in node_cache):
         node_cache.append(device_info)
     if manager.active_connections:
@@ -264,29 +387,6 @@ async def device_keepalive():
         await loop.run_in_executor(None, probe_known_devices)
         await asyncio.sleep(10)
 
-@app.on_event("startup")
-async def startup_event():
-    loop = asyncio.get_running_loop()
-
-    # Bridge the sync passive_monitor callbacks into the async event loop
-    def on_device_connected(device_info: dict):
-        asyncio.run_coroutine_threadsafe(broadcast_device_connected(device_info), loop)
-
-    def on_device_updated(device_info: dict):
-        asyncio.run_coroutine_threadsafe(broadcast_device_updated(device_info), loop)
-
-    set_on_connect_callback(on_device_connected)
-    set_on_update_callback(on_device_updated)
-
-    asyncio.create_task(heartbeat())
-    asyncio.create_task(passive_discovery_broadcast())
-    asyncio.create_task(stale_device_checker())
-    asyncio.create_task(device_keepalive())
-    asyncio.create_task(startup_scan())       # Full scan ~5 s after boot
-    asyncio.create_task(periodic_discovery()) # Repeat every PERIODIC_SCAN_INTERVAL
-
-    start_passive_monitoring()
-
 # --- REST Endpoints ---
 
 @app.get("/nodes")
@@ -311,18 +411,44 @@ async def clear_cache():
     print("Vantage: Cache purged.")
     return {"status": "cleared"}
 
+@app.get("/aliases")
+async def get_aliases():
+    """Return the current MAC → alias name map."""
+    return {"aliases": aliases}
+
+@app.post("/alias")
+async def set_alias(request: Request):
+    """Create or delete a device alias.
+    Body: { "mac": "aa:bb:cc:dd:ee:ff", "name": "My NAS" }
+    Send an empty/blank name to remove an existing alias.
+    """
+    data = await request.json()
+    mac  = (data.get("mac") or "").lower().strip()
+    name = (data.get("name") or "").strip()
+    if not mac:
+        raise HTTPException(status_code=400, detail="mac is required")
+    if name:
+        aliases[mac] = name
+    else:
+        aliases.pop(mac, None)
+    await _save_aliases_async()
+    await manager.broadcast({"type": "ALIASES_UPDATED", "aliases": aliases})
+    return {"status": "ok"}
+
 # --- WebSocket Interface ---
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    # If a scan is already running when this client connects, tell them immediately
-    # so the frontend can show the loading screen without waiting for the next message.
-    if scan_in_progress:
-        try:
+    try:
+        # Surface any setup problems immediately so the frontend can show an error modal
+        if setup_errors:
+            await websocket.send_text(json.dumps({"type": "SETUP_ERROR", "errors": setup_errors}))
+        # If a scan is already running, tell the client so it shows the loading screen
+        if scan_in_progress:
             await websocket.send_text(json.dumps({"type": "SCAN_STARTED"}))
-        except Exception:
-            pass
+    except Exception:
+        pass
     try:
         while True:
             await websocket.receive_text()
@@ -334,4 +460,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Bind to loopback only — Vantage is a local tool and should not be
+    # reachable from other devices on the network.
+    uvicorn.run(app, host="127.0.0.1", port=8001)

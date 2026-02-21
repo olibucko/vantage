@@ -16,6 +16,7 @@ export interface NetworkNode {
   deviceName?: string | null;
   confidence?: number;
   lastSeen?: number;
+  firstSeen?: number;
 }
 
 export interface GraphNode extends NetworkNode {

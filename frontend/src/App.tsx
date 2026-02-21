@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import GraphView from './GraphView';
 import type { GraphViewHandle } from './GraphView';
-import { Shield, RefreshCw, Activity, X, Wifi, Monitor, Cpu, HardDrive, Lock, Unlock } from 'lucide-react';
+import { Shield, RefreshCw, X, Wifi, Monitor, Cpu, HardDrive, Lock, Unlock, Pencil, AlertTriangle } from 'lucide-react';
 import type { NetworkNode, AnimEntry } from './types';
 
 function App() {
@@ -21,6 +21,28 @@ function App() {
   // devices all finishing at once) causes only ONE re-render instead of twenty.
   const pendingUpdatesRef = useRef<Map<string, NetworkNode>>(new Map());
   const updateFlushTimer = useRef<NodeJS.Timeout | null>(null);
+
+  // MAC → user-defined alias. Loaded from /aliases on mount; kept in sync via WS.
+  const [aliases, setAliases] = useState<Record<string, string>>({});
+  // Setup errors pushed by the backend if prerequisites (admin rights, Npcap) are missing.
+  const [setupErrors, setSetupErrors] = useState<string[]>([]);
+  // Alias editing state for the info panel header.
+  const [editingAlias, setEditingAlias] = useState(false);
+  const [aliasInput, setAliasInput] = useState('');
+
+  // Load aliases once on mount
+  useEffect(() => {
+    fetch('http://localhost:8001/aliases')
+      .then(r => r.json())
+      .then(data => setAliases(data.aliases || {}))
+      .catch(() => {});
+  }, []);
+
+  // Reset alias editing whenever the selected node changes
+  useEffect(() => {
+    setEditingAlias(false);
+    setAliasInput(aliases[(selectedNode?.mac || '').toLowerCase()] || '');
+  }, [selectedNode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const loadCache = async () => {
@@ -188,6 +210,12 @@ function App() {
             }, 300);
           }
 
+        } else if (d.type === 'ALIASES_UPDATED') {
+          setAliases(d.aliases);
+
+        } else if (d.type === 'SETUP_ERROR') {
+          setSetupErrors(d.errors);
+
         } else if (d.type === 'HEARTBEAT') {
           // silent
         }
@@ -219,42 +247,53 @@ function App() {
 
   const triggerScan = () => { setScanning(true); fetch('http://localhost:8001/scan'); };
 
+  const saveAlias = () => {
+    if (!selectedNode) return;
+    setEditingAlias(false);
+    const name = aliasInput.trim();
+    const mac  = selectedNode.mac.toLowerCase();
+    // Optimistic update so the UI responds instantly
+    setAliases(prev => {
+      const next = { ...prev };
+      if (name) next[mac] = name; else delete next[mac];
+      return next;
+    });
+    fetch('http://localhost:8001/alias', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mac, name }),
+    }).catch(() => {});
+  };
+
   // Use Right Click to avoid Drag competition [cite: 2026-02-20]
   const handleNodeInteraction = (node: NetworkNode, event: MouseEvent) => {
     event.preventDefault();
     setSelectedNode(node);
   };
 
-  // Generate display name: Device Type (Vendor) or fallback to IP
+  // Generate display name: alias → mDNS → type → vendor → hostname → IP
   const getDisplayName = (node: NetworkNode): string => {
-    const type = node.type;
-    const vendor = node.vendor;
+    // User-defined alias is the highest priority
+    const alias = aliases[(node.mac || '').toLowerCase()];
+    if (alias) return alias;
 
-    // If we have a friendly mDNS name, use it
+    // Friendly mDNS name (e.g. "Oliver's iPhone")
     if (node.deviceName && node.deviceName !== "Unknown") {
       return node.deviceName;
     }
 
-    // Priority: "Device Type" if specific, otherwise fallback hierarchy
-    if (type && type !== "Unknown Device" && type !== "Generic Device") {
-      // If type already contains vendor (e.g., "TP-Link Router"), use as-is
-      if (vendor !== "Unknown" && type.includes(vendor)) {
-        return type;
-      }
-      // Otherwise combine: "Device Type (Vendor)"
-      if (vendor !== "Unknown") {
-        return `${type} (${vendor})`;
-      }
-      // Just type
-      return type;
+    // Device type — never append NIC vendor here; it's shown in the info panel.
+    // Type strings already embed the vendor when relevant (e.g. "Hikvision NVR/Camera").
+    if (node.type && node.type !== "Unknown Device" && node.type !== "Generic Device") {
+      return node.type;
     }
 
-    // Fallback: Vendor Device
-    if (vendor !== "Unknown") {
-      return `${vendor} Device`;
+    // Fallback: vendor is at least something (randomized MACs → "Unknown")
+    if (node.vendor !== "Unknown") {
+      return `${node.vendor} Device`;
     }
 
-    // Last resort: hostname or IP
+    // Last resort: mDNS hostname, reverse-DNS hostname, or raw IP
     if (node.hostname && node.hostname !== "Unknown") {
       return node.hostname;
     }
@@ -321,7 +360,7 @@ function App() {
       nodes: orderedNodes,
       links: nodes.filter(n => n.ip !== gateway.ip).map(n => ({ source: gateway.ip, target: n.ip })),
     };
-  }, [nodes]);
+  }, [nodes, aliases]);
 
   return (
     <div className="flex flex-col h-screen w-screen bg-[#020202] text-neutral-100 font-sans overflow-hidden">
@@ -345,7 +384,7 @@ function App() {
         </div>
       </header>
 
-      <main className="flex-1 relative z-10 w-full h-full">
+      <main className="flex-1 min-h-0 relative z-10 w-full overflow-hidden">
         {/* Background Grid Layer [cite: 2026-02-20] */}
         <div
           className="absolute inset-0 opacity-50 pointer-events-none"
@@ -391,10 +430,11 @@ function App() {
         )}
         
         {/* ── Initial Loading Screen ─────────────────────────────────────────
-             Shown only when a scan is running AND no nodes are visible yet.
-             Once nodes exist (from cache or first SCAN_COMPLETE) this unmounts
-             and the graph takes over. ──────────────────────────────────────── */}
-        {scanning && nodes.length === 0 && (
+             Shown whenever there are no nodes to display — covers the window
+             between app load and first SCAN_COMPLETE (including the delay before
+             the backend sends SCAN_STARTED). Unmounts as soon as any node data
+             arrives. ──────────────────────────────────────────────────────────*/}
+        {nodes.length === 0 && wsStatus !== 'disconnected' && (
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center">
             {/* Background — matches the app shell */}
             <div className="absolute inset-0 bg-[#020202]" />
@@ -468,11 +508,32 @@ function App() {
                 <div className="p-3 bg-blue-600/20 rounded-xl border border-blue-500/30 shadow-[0_0_20px_rgba(59,130,246,0.2)]">
                   <Monitor className="w-6 h-6 text-blue-400" />
                 </div>
-                <div>
-                  <h2 className="text-xl font-black text-white tracking-wider">
-                    {selectedNode.hostname !== 'Unknown' ? selectedNode.hostname : selectedNode.ip}
-                  </h2>
-                  <p className="text-xs text-blue-400 font-mono tracking-widest uppercase">{selectedNode.type}</p>
+                <div className="min-w-0">
+                  {editingAlias ? (
+                    <input
+                      autoFocus
+                      className="text-xl font-black text-white tracking-wider bg-transparent border-b border-blue-500 outline-none w-full"
+                      value={aliasInput}
+                      onChange={e => setAliasInput(e.target.value)}
+                      onBlur={saveAlias}
+                      onKeyDown={e => { if (e.key === 'Enter') saveAlias(); if (e.key === 'Escape') setEditingAlias(false); }}
+                      placeholder="Enter custom label…"
+                    />
+                  ) : (
+                    <div className="flex items-center gap-2 group">
+                      <h2 className="text-xl font-black text-white tracking-wider truncate">
+                        {getDisplayName(selectedNode)}
+                      </h2>
+                      <button
+                        onClick={() => { setEditingAlias(true); setAliasInput(aliases[(selectedNode.mac || '').toLowerCase()] || ''); }}
+                        className="opacity-0 group-hover:opacity-60 hover:!opacity-100 transition-opacity shrink-0"
+                        title="Set custom label"
+                      >
+                        <Pencil className="w-3.5 h-3.5 text-neutral-400" />
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-blue-400 font-mono tracking-widest uppercase">{selectedNode.ip}</p>
                 </div>
               </div>
               <button
@@ -526,6 +587,26 @@ function App() {
                     <p className="text-sm font-mono font-bold text-white break-all">{selectedNode.mac}</p>
                   </div>
                 </div>
+                {(selectedNode.firstSeen || selectedNode.lastSeen) && (
+                  <div className="grid grid-cols-2 gap-4">
+                    {selectedNode.firstSeen && (
+                      <div className="p-4 bg-white/8 rounded-xl border border-white/20">
+                        <p className="text-[10px] font-bold uppercase tracking-widest text-neutral-500 mb-1">First Seen</p>
+                        <p className="text-sm font-mono font-bold text-white">
+                          {new Date(selectedNode.firstSeen * 1000).toLocaleString()}
+                        </p>
+                      </div>
+                    )}
+                    {selectedNode.lastSeen && (
+                      <div className="p-4 bg-white/8 rounded-xl border border-white/20">
+                        <p className="text-[10px] font-bold uppercase tracking-widest text-neutral-500 mb-1">Last Seen</p>
+                        <p className="text-sm font-mono font-bold text-white">
+                          {new Date(selectedNode.lastSeen * 1000).toLocaleString()}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Hardware Information */}
@@ -535,7 +616,7 @@ function App() {
                 </h3>
                 <div className="grid grid-cols-2 gap-4">
                   <div className="p-4 bg-white/8 rounded-xl border border-white/20">
-                    <p className="text-[10px] font-bold uppercase tracking-widest text-neutral-500 mb-1">Vendor</p>
+                    <p className="text-[10px] font-bold uppercase tracking-widest text-neutral-500 mb-1">NIC Vendor</p>
                     <p className="text-base font-bold text-white">{selectedNode.vendor}</p>
                   </div>
                   <div className="p-4 bg-white/8 rounded-xl border border-white/20">
@@ -615,6 +696,36 @@ function App() {
             </div>
           </div>
         )}
+
+        {/* Setup Error Modal */}
+        {setupErrors.length > 0 && (
+          <div className="absolute inset-0 z-[99999] flex items-center justify-center bg-black/80 backdrop-blur-sm">
+            <div className="w-[520px] bg-gradient-to-br from-gray-900 to-black border-2 border-red-500/40 rounded-2xl shadow-[0_0_60px_rgba(239,68,68,0.2)] p-8">
+              <div className="flex items-center gap-4 mb-6">
+                <div className="p-3 bg-red-600/20 rounded-xl border border-red-500/30">
+                  <AlertTriangle className="w-6 h-6 text-red-400" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-black text-white tracking-wider">Setup Required</h2>
+                  <p className="text-xs text-red-400 font-mono tracking-widest uppercase">Vantage cannot scan without the following</p>
+                </div>
+              </div>
+              <div className="space-y-3 mb-6">
+                {setupErrors.map((err, i) => (
+                  <div key={i} className="p-4 bg-red-950/30 border border-red-500/20 rounded-xl">
+                    <p className="text-sm text-red-200">{err}</p>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => setSetupErrors([])}
+                className="w-full py-3 rounded-xl bg-red-600/20 border border-red-500/30 text-red-300 text-sm font-black uppercase tracking-widest hover:bg-red-600/30 transition-colors"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
       </main>
 
       <footer className="px-10 py-4 border-t border-white/20 bg-black/80 backdrop-blur-xl text-[10px] font-mono text-neutral-600 flex justify-between items-center shrink-0">
@@ -646,7 +757,7 @@ function App() {
             <span className="uppercase tracking-wider font-bold text-blue-500/70">{nodes.length} Nodes Discovered</span>
           </div>
         </div>
-        <span className="text-neutral-500 uppercase tracking-widest font-black">Subnet Scope: 192.168.20.0/24</span>
+        <span className="text-neutral-500 uppercase tracking-widest font-black">Subnet Scope: {gatewayIp.replace(/\.\d+$/, '.0/24')}</span>
       </footer>
     </div>
   );
