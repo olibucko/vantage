@@ -16,6 +16,11 @@ function App() {
   // Mirror of `nodes` state for synchronous reads inside WS callbacks (avoids stale closures)
   const nodesRef = useRef<NetworkNode[]>([]);
   const graphRef = useRef<GraphViewHandle>(null);
+  // Buffer for DEVICE_UPDATED messages — flushed in a single setNodes call after a
+  // brief debounce so that a burst of simultaneous interrogation completions (e.g. 20
+  // devices all finishing at once) causes only ONE re-render instead of twenty.
+  const pendingUpdatesRef = useRef<Map<string, NetworkNode>>(new Map());
+  const updateFlushTimer = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const loadCache = async () => {
@@ -166,9 +171,21 @@ function App() {
         } else if (d.type === 'DEVICE_UPDATED') {
           const updated: NetworkNode = d.node;
           if (nodesRef.current.some(n => n.ip === updated.ip)) {
-            nodesRef.current = nodesRef.current.map(n => n.ip === updated.ip ? { ...n, ...updated } : n);
-            setNodes([...nodesRef.current]);
-            console.log(`Vantage: Device updated — ${updated.ip} (${updated.type})`);
+            // Buffer update; flush the whole batch in one setNodes call after 300 ms of quiet.
+            // This prevents a re-render cascade when many devices finish interrogation at once.
+            pendingUpdatesRef.current.set(updated.ip, updated);
+            console.log(`Vantage: Device updated (buffered) — ${updated.ip} (${updated.type})`);
+
+            if (updateFlushTimer.current) clearTimeout(updateFlushTimer.current);
+            updateFlushTimer.current = setTimeout(() => {
+              if (pendingUpdatesRef.current.size > 0) {
+                const batch = pendingUpdatesRef.current;
+                nodesRef.current = nodesRef.current.map(n => batch.has(n.ip) ? { ...n, ...batch.get(n.ip)! } : n);
+                setNodes([...nodesRef.current]);
+                console.log(`Vantage: Flushed ${batch.size} device update(s)`);
+                pendingUpdatesRef.current = new Map();
+              }
+            }, 300);
           }
 
         } else if (d.type === 'HEARTBEAT') {

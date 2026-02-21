@@ -63,6 +63,18 @@ def load_cache():
 load_cache()
 preload_from_cache(node_cache)  # Seed passive monitor so stale checker can track cached devices
 
+# --- Cache Persistence Helpers ---
+
+def _write_cache_sync(data: list):
+    """Synchronous disk write — always called via run_in_executor, never directly from the event loop."""
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+async def _save_cache_async(data: list):
+    """Persist node_cache to disk without blocking the event loop."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _write_cache_sync, data)
+
 # --- WebSocket Manager ---
 class ConnectionManager:
     def __init__(self):
@@ -116,13 +128,14 @@ async def run_scan(mdns_duration: int = 30) -> bool:
         loop = asyncio.get_event_loop()
         nodes = await loop.run_in_executor(None, scan_network, subnet, mdns_duration)
 
-        merged_nodes = merge_with_active_scan(nodes)
+        # Run merge + preload in executor — both acquire devices_lock (threading.Lock)
+        # and should not block the event loop thread.
+        merged_nodes = await loop.run_in_executor(None, merge_with_active_scan, nodes)
         # Refresh lastSeen so stale checker doesn't evict devices just confirmed online
-        preload_from_cache(merged_nodes)
+        await loop.run_in_executor(None, preload_from_cache, merged_nodes)
         node_cache = merged_nodes
 
-        with open(DATA_FILE, "w") as f:
-            json.dump(merged_nodes, f, indent=4)
+        await _save_cache_async(merged_nodes)
 
         await manager.broadcast({"type": "SCAN_COMPLETE", "nodes": merged_nodes})
         print(f"Vantage: Scan complete — {len(merged_nodes)} nodes ({len(nodes)} active + passive).")
@@ -168,25 +181,32 @@ async def heartbeat():
         await asyncio.sleep(15)
 
 async def passive_discovery_broadcast():
-    """Periodically broadcast passive discoveries to connected clients."""
+    """Periodically broadcast passive discoveries to connected clients.
+    Only fires when passive monitoring has found devices not yet in node_cache,
+    avoiding wasteful full-payload broadcasts every 30 s when nothing changed.
+    """
     global node_cache
     await asyncio.sleep(10)  # Wait for initial setup
 
     while True:
-        passive_devices = get_passive_discoveries()
-        if passive_devices and manager.active_connections:
-            merged_nodes = merge_with_active_scan(node_cache)
-            node_cache = merged_nodes
+        if manager.active_connections:
+            passive_devices = get_passive_discoveries()
+            # Only act when passive monitoring has found IPs not already tracked
+            active_ips = {n['ip'] for n in node_cache}
+            new_passive = [d for d in passive_devices if d['ip'] not in active_ips]
+            if new_passive:
+                loop = asyncio.get_event_loop()
+                merged_nodes = await loop.run_in_executor(None, merge_with_active_scan, node_cache)
+                node_cache = merged_nodes
 
-            with open(DATA_FILE, "w") as f:
-                json.dump(merged_nodes, f, indent=4)
+                await _save_cache_async(merged_nodes)
 
-            await manager.broadcast({
-                "type": "PASSIVE_UPDATE",
-                "nodes": merged_nodes,
-                "new_count": len(passive_devices)
-            })
-            print(f"Vantage: Broadcasted passive update ({len(passive_devices)} passive devices)")
+                await manager.broadcast({
+                    "type": "PASSIVE_UPDATE",
+                    "nodes": merged_nodes,
+                    "new_count": len(new_passive)
+                })
+                print(f"Vantage: Broadcasted passive update ({len(new_passive)} new passive device(s))")
 
         await asyncio.sleep(30)
 
@@ -201,13 +221,15 @@ async def broadcast_device_connected(device_info: dict):
         print(f"Vantage: Broadcasted DEVICE_CONNECTED for {ip}")
 
 async def broadcast_device_updated(device_info: dict):
-    """Push enriched device data to all clients after deep interrogation completes."""
+    """Push enriched device data to all clients after deep interrogation completes.
+    node_cache is updated in memory immediately; disk persistence is deferred to
+    the next run_scan or passive_discovery_broadcast to avoid blocking the event
+    loop with a disk write on every individual device update.
+    """
     global node_cache
     ip = device_info.get('ip')
     if ip:
         node_cache = [device_info if n.get('ip') == ip else n for n in node_cache]
-        with open(DATA_FILE, "w") as f:
-            json.dump(node_cache, f, indent=4)
     if manager.active_connections:
         await manager.broadcast({"type": "DEVICE_UPDATED", "node": device_info})
         print(f"Vantage: Broadcasted DEVICE_UPDATED for {ip} ({device_info.get('type', 'Unknown')})")
@@ -227,8 +249,7 @@ async def stale_device_checker():
             remove_device(ip)
             node_cache = [n for n in node_cache if n.get('ip') != ip]
         if stale:
-            with open(DATA_FILE, "w") as f:
-                json.dump(node_cache, f, indent=4)
+            await _save_cache_async(node_cache)
         await asyncio.sleep(10)
 
 async def device_keepalive():

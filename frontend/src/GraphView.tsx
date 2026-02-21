@@ -117,14 +117,17 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
           if (entry) {
             const elapsed = performance.now() - entry.startTime;
             if (entry.type === 'spawn') {
-              const t = Math.min(elapsed / 800, 1);
+              // Clamp to [0,1]: elapsed can be negative for staggered nodes whose
+              // startTime is still in the future, which would make ringRadius negative
+              // and cause a CanvasRenderingContext2D.arc DOMException.
+              const t = Math.min(Math.max(elapsed / 800, 0), 1);
               const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
               scale = eased;
               alpha = eased;
               drawRing = t < 1;
               ringT = t;
             } else if (entry.type === 'despawn') {
-              const t = Math.min(elapsed / 600, 1);
+              const t = Math.min(Math.max(elapsed / 600, 0), 1);
               const eased = 1 - Math.pow(t, 3); // ease-in cubic (reversed)
               scale = eased;
               alpha = eased;
@@ -185,7 +188,7 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
             ctx.stroke();
 
           } else if (entry.type === 'spawn') {
-            const t = Math.min((performance.now() - entry.startTime) / 800, 1);
+            const t = Math.min(Math.max((performance.now() - entry.startTime) / 800, 0), 1);
             // ease-in-out: beam extends from source toward target
             const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
             const bx = sx + (tx - sx) * e;
@@ -210,7 +213,7 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
             }
 
           } else if (entry.type === 'despawn') {
-            const t = Math.min((performance.now() - entry.startTime) / 600, 1);
+            const t = Math.min(Math.max((performance.now() - entry.startTime) / 600, 0), 1);
             // ease-in: beam retracts from target back toward source
             const e = t * t;
             const bx = tx + (sx - tx) * e;

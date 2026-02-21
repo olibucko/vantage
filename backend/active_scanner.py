@@ -1,9 +1,17 @@
+import logging
+import warnings
 from scapy.all import ARP, Ether, srp, IP, ICMP, sr1, TCP
 import socket
 import struct
 import time
 import uuid
 import concurrent.futures
+
+# Suppress Scapy's "MAC address to reach destination not found" warning.
+# This fires when sr1/send can't find the target in the ARP cache and falls
+# back to broadcast — harmless behaviour but noisy in the backend console.
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message="MAC address to reach destination not found")
 from vendor_lookup import get_vendor
 from service_detector import (
     start_mdns_discovery, grab_banner, detect_device_type_advanced,

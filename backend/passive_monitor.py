@@ -49,8 +49,10 @@ def probe_known_devices():
 
     for ip, mac in targets:
         try:
-            # Unicast to the known MAC when available, broadcast otherwise
-            dst = mac if mac else 'ff:ff:ff:ff:ff:ff'
+            # Unicast to the known MAC when available, broadcast otherwise.
+            # Treat '00:00:00:00:00:00' (placeholder for unresolved ONVIF/SSDP
+            # devices) as missing — sending to it triggers Scapy routing warnings.
+            dst = mac if (mac and mac != '00:00:00:00:00:00') else 'ff:ff:ff:ff:ff:ff'
             sendp(Ether(dst=dst) / ARP(op=1, pdst=ip), verbose=0)
         except Exception:
             pass
