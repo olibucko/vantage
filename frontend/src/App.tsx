@@ -11,7 +11,8 @@ function App() {
   const [scanning, setScanning] = useState(false);
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const ws = useRef<WebSocket | null>(null);
-  const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryCount = useRef(0);
   const animStateRef = useRef<Map<string, AnimEntry>>(new Map());
   // Mirror of `nodes` state for synchronous reads inside WS callbacks (avoids stale closures)
   const nodesRef = useRef<NetworkNode[]>([]);
@@ -20,7 +21,18 @@ function App() {
   // brief debounce so that a burst of simultaneous interrogation completions (e.g. 20
   // devices all finishing at once) causes only ONE re-render instead of twenty.
   const pendingUpdatesRef = useRef<Map<string, NetworkNode>>(new Map());
-  const updateFlushTimer = useRef<NodeJS.Timeout | null>(null);
+  const updateFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // True while the startup loading screen should be visible.
+  // Decoupled from nodes.length so PASSIVE_UPDATE events don't prematurely hide it.
+  const [showLoader, setShowLoader] = useState(true);
+  // Live scan progress from SCAN_PROGRESS events (percent + phase message).
+  const [scanProgress, setScanProgress] = useState<{ percent: number; message: string } | null>(null);
+  // How many consecutive WS close events have fired — drives the amber reconnect banner.
+  const [wsRetries, setWsRetries] = useState(0);
+  // Node currently under the cursor — drives the hover tooltip.
+  const [hoveredNode, setHoveredNode] = useState<NetworkNode | null>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
 
   // MAC → user-defined alias. Loaded from /aliases on mount; kept in sync via WS.
   const [aliases, setAliases] = useState<Record<string, string>>({});
@@ -43,6 +55,23 @@ function App() {
     setEditingAlias(false);
     setAliasInput(aliases[(selectedNode?.mac || '').toLowerCase()] || '');
   }, [selectedNode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Update hover tooltip position via direct DOM mutation to avoid per-frame re-renders
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!tooltipRef.current || !hoveredNode) return;
+      const el = tooltipRef.current;
+      const tw = el.offsetWidth, th = el.offsetHeight;
+      let left = e.clientX + 16;
+      let top  = e.clientY - 8;
+      if (left + tw > window.innerWidth  - 8) left = e.clientX - tw - 16;
+      if (top  + th > window.innerHeight - 8) top  = window.innerHeight - th - 8;
+      el.style.left = `${left}px`;
+      el.style.top  = `${top}px`;
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    return () => window.removeEventListener('mousemove', onMouseMove);
+  }, [hoveredNode]);
 
   useEffect(() => {
     const loadCache = async () => {
@@ -81,6 +110,8 @@ function App() {
       socket.onopen = () => {
         console.log("Vantage: WebSocket connected!");
         setWsStatus('connected');
+        retryCount.current = 0;
+        setWsRetries(0);
         if (reconnectTimeout.current) {
           clearTimeout(reconnectTimeout.current);
           reconnectTimeout.current = null;
@@ -89,8 +120,6 @@ function App() {
 
       socket.onmessage = (e) => {
         const d = JSON.parse(e.data);
-        console.log("Vantage: Received message:", d.type);
-
         if (d.type === 'SCAN_COMPLETE') {
           const scanNodes: NetworkNode[] = d.nodes;
           const scanIpSet = new Set(scanNodes.map((n: NetworkNode) => n.ip));
@@ -140,13 +169,20 @@ function App() {
 
           console.log(`Vantage: Scan complete — ${scanNodes.length} live, ${removedIps.length} removed, ${addedIps.length} new`);
           setScanning(false);
+          setShowLoader(false);
+          setScanProgress(null);
 
         } else if (d.type === 'SCAN_STARTED') {
           setScanning(true);
           console.log("Vantage: Scan started");
 
+        } else if (d.type === 'SCAN_PROGRESS') {
+          setScanProgress({ percent: d.percent, message: d.message });
+
         } else if (d.type === 'SCAN_FAILED') {
           setScanning(false);
+          setShowLoader(false);
+          setScanProgress(null);
           console.warn("Vantage: Scan failed");
 
         } else if (d.type === 'PASSIVE_UPDATE') {
@@ -217,7 +253,11 @@ function App() {
           setSetupErrors(d.errors);
 
         } else if (d.type === 'HEARTBEAT') {
-          // silent
+          // Dismiss the startup loader if the backend is idle and we have cached nodes.
+          // This handles the page-refresh case where /nodes already loaded data before WS connected.
+          if (!d.scan_in_progress && nodesRef.current.length > 0) {
+            setShowLoader(false);
+          }
         }
       };
 
@@ -227,7 +267,9 @@ function App() {
       };
 
       socket.onclose = () => {
-        console.log("Vantage: WebSocket disconnected, reconnecting in 3s...");
+        retryCount.current += 1;
+        setWsRetries(r => r + 1);
+        console.log(`Vantage: WebSocket disconnected (attempt ${retryCount.current}), reconnecting in 3s...`);
         setWsStatus('disconnected');
         reconnectTimeout.current = setTimeout(connect, 3000);
       };
@@ -344,10 +386,6 @@ function App() {
         name: 'Gateway',
         val: 6,
         color: '#3b82f6',
-        x: undefined,
-        y: undefined,
-        vx: undefined,
-        vy: undefined,
       });
     }
 
@@ -372,7 +410,7 @@ function App() {
           </div>
           <div>
             <h1 className="text-2xl font-black tracking-widest uppercase italic text-white leading-none">Vantage</h1>
-            <span className="text-[10px] text-blue-500/60 font-mono tracking-[0.3em] uppercase font-bold">Synoptic Discovery</span>
+            <span className="text-[10px] text-blue-500/60 font-mono tracking-[0.3em] uppercase font-bold">Network Viewer</span>
           </div>
         </div>
 
@@ -383,6 +421,14 @@ function App() {
           </button>
         </div>
       </header>
+
+      {/* Amber reconnect banner — shown after a few failed attempts, well before the full offline state */}
+      {wsRetries >= 2 && wsStatus !== 'connected' && (
+        <div className="flex items-center justify-center gap-3 px-6 py-2 bg-amber-500/10 border-b border-amber-500/20 text-amber-400 text-[10px] font-mono uppercase tracking-widest shrink-0">
+          <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping" />
+          Backend unreachable — attempting to reconnect…
+        </div>
+      )}
 
       <main className="flex-1 min-h-0 relative z-10 w-full overflow-hidden">
         {/* Background Grid Layer [cite: 2026-02-20] */}
@@ -434,7 +480,7 @@ function App() {
              between app load and first SCAN_COMPLETE (including the delay before
              the backend sends SCAN_STARTED). Unmounts as soon as any node data
              arrives. ──────────────────────────────────────────────────────────*/}
-        {nodes.length === 0 && wsStatus !== 'disconnected' && (
+        {showLoader && wsStatus !== 'disconnected' && (
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center">
             {/* Background — matches the app shell */}
             <div className="absolute inset-0 bg-[#020202]" />
@@ -474,22 +520,90 @@ function App() {
                 </p>
               </div>
 
-              {/* Shuttle progress bar */}
-              <div className="w-72 h-px bg-white/10 relative overflow-hidden rounded-full">
-                <div
-                  className="absolute inset-y-0 w-2/5 bg-gradient-to-r from-transparent via-blue-500 to-transparent"
-                  style={{ animation: 'scanline 1.8s ease-in-out infinite' }}
-                />
+              {/* Progress bar — determinate fill when scan phases report in, shimmer otherwise */}
+              <div className="w-72 space-y-2">
+                <div className="h-px bg-white/10 relative overflow-hidden rounded-full">
+                  {scanProgress ? (
+                    <div
+                      className="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-600 to-blue-400 rounded-full transition-all duration-500"
+                      style={{ width: `${scanProgress.percent}%` }}
+                    />
+                  ) : (
+                    <div
+                      className="absolute inset-y-0 w-2/5 bg-gradient-to-r from-transparent via-blue-500 to-transparent"
+                      style={{ animation: 'scanline 1.8s ease-in-out infinite' }}
+                    />
+                  )}
+                </div>
+                {scanProgress ? (
+                  <p className="text-[10px] font-mono tracking-wider text-blue-400/70 uppercase text-center">
+                    {scanProgress.message}
+                  </p>
+                ) : (
+                  <p className="text-[10px] font-mono tracking-widest text-neutral-600 uppercase text-center">
+                    This may take ~30 seconds on first run
+                  </p>
+                )}
               </div>
-
-              <p className="text-[10px] font-mono tracking-widest text-neutral-600 uppercase">
-                This may take ~30 seconds on first run
-              </p>
             </div>
           </div>
         )}
 
-        <GraphView ref={graphRef} data={graphData} gatewayId={gatewayIp} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} animStateRef={animStateRef} />
+        <GraphView
+          ref={graphRef}
+          data={graphData}
+          gatewayId={gatewayIp}
+          onNodeRightClick={handleNodeInteraction}
+          onBackgroundClick={() => setSelectedNode(null)}
+          animStateRef={animStateRef}
+          onNodeHover={(node) => setHoveredNode(node)}
+        />
+
+        {/* Hover tooltip — positioned via direct DOM mutation on mousemove */}
+        {hoveredNode && (
+          <div
+            ref={tooltipRef}
+            className="fixed z-[9998] pointer-events-none bg-black/90 border border-white/15 rounded-xl px-4 py-3 shadow-2xl backdrop-blur-xl max-w-[240px]"
+            style={{ left: 0, top: 0 }}
+          >
+            <p className="text-sm font-black text-white truncate">{getDisplayName(hoveredNode)}</p>
+            <p className="text-xs font-mono text-blue-400 mt-0.5">{hoveredNode.ip}</p>
+
+            {/* Device classification */}
+            {hoveredNode.type && hoveredNode.type !== 'Unknown Device' ? (
+              <p className="text-[10px] text-neutral-400 mt-1.5 uppercase tracking-wider font-bold">{hoveredNode.type}</p>
+            ) : hoveredNode.vendor && hoveredNode.vendor !== 'Unknown' ? (
+              <p className="text-[10px] text-neutral-400 mt-1.5 font-mono">{hoveredNode.vendor}</p>
+            ) : null}
+            {hoveredNode.os && hoveredNode.os !== 'Unknown' && (
+              <p className="text-[10px] text-neutral-500 font-mono">{hoveredNode.os}</p>
+            )}
+
+            {/* Running services */}
+            {hoveredNode.services && hoveredNode.services.length > 0 ? (
+              <div className="mt-2 space-y-0.5 border-t border-white/10 pt-2">
+                {hoveredNode.services.slice(0, 4).map((svc, i) => (
+                  <p key={i} className="text-[10px] font-mono text-neutral-400">
+                    <span className="text-orange-400/80">{svc.port}</span>
+                    <span className="text-neutral-600"> · </span>
+                    {svc.name}
+                  </p>
+                ))}
+                {hoveredNode.services.length > 4 && (
+                  <p className="text-[10px] text-neutral-600">+{hoveredNode.services.length - 4} more</p>
+                )}
+              </div>
+            ) : hoveredNode.ports && hoveredNode.ports.length > 0 ? (
+              <p className="text-[10px] text-neutral-400 mt-2 border-t border-white/10 pt-2">
+                {hoveredNode.ports.length} open port{hoveredNode.ports.length !== 1 ? 's' : ''}
+              </p>
+            ) : null}
+
+            <p className="text-[9px] text-neutral-600 mt-2 uppercase tracking-widest font-bold border-t border-white/10 pt-2">
+              Right-click for full details
+            </p>
+          </div>
+        )}
         
         {/* Tactical Legend — Color Engine [cite: 2026-02-20] */}
         <div className="absolute top-10 left-10 p-6 bg-black/80 border border-white/25 rounded-2xl backdrop-blur-2xl flex flex-col gap-4 pointer-events-none z-20 shadow-2xl">
@@ -520,8 +634,8 @@ function App() {
                       placeholder="Enter custom label…"
                     />
                   ) : (
-                    <div className="flex items-center gap-2 group">
-                      <h2 className="text-xl font-black text-white tracking-wider truncate">
+                    <div className="flex items-center gap-2 group min-w-0">
+                      <h2 className="text-xl font-black text-white tracking-wider truncate min-w-0">
                         {getDisplayName(selectedNode)}
                       </h2>
                       <button
@@ -730,7 +844,7 @@ function App() {
 
       <footer className="px-10 py-4 border-t border-white/20 bg-black/80 backdrop-blur-xl text-[10px] font-mono text-neutral-600 flex justify-between items-center shrink-0">
         <div className="flex items-center gap-8">
-          <span className="uppercase tracking-[0.4em] font-bold">Vantage v1.2.8</span>
+          <span className="uppercase tracking-[0.4em] font-bold">Vantage v1.0.0</span>
 
           {/* Connection Status Indicator */}
           {wsStatus === 'connected' && (

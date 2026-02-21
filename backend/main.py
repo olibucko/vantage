@@ -241,10 +241,20 @@ async def run_scan(mdns_duration: int = 30) -> bool:
     subnet = ".".join(local_ip.split('.')[:-1]) + ".0/24"
     print(f"Vantage: Scan starting on {subnet} (mDNS={mdns_duration}s)...")
 
+    # Bridge scan-thread progress events into the async event loop so the
+    # frontend loading screen can show a live fill-bar with phase messages.
+    loop = asyncio.get_event_loop()
+    def _broadcast_progress(percent: int, message: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast({"type": "SCAN_PROGRESS", "percent": percent, "message": message}),
+            loop,
+        )
+
     try:
         await manager.broadcast({"type": "SCAN_STARTED", "subnet": subnet})
-        loop = asyncio.get_event_loop()
-        nodes = await loop.run_in_executor(None, scan_network, subnet, mdns_duration)
+        nodes = await loop.run_in_executor(
+            None, scan_network, subnet, mdns_duration, _broadcast_progress
+        )
 
         # Run merge + preload in executor — both acquire devices_lock (threading.Lock)
         # and should not block the event loop thread.
@@ -299,7 +309,7 @@ async def heartbeat():
     """Keeps WebSocket connections alive by sending a periodic pulse."""
     while True:
         if manager.active_connections:
-            await manager.broadcast({"type": "HEARTBEAT"})
+            await manager.broadcast({"type": "HEARTBEAT", "scan_in_progress": scan_in_progress})
         await asyncio.sleep(15)
 
 async def passive_discovery_broadcast():
@@ -308,7 +318,7 @@ async def passive_discovery_broadcast():
     avoiding wasteful full-payload broadcasts every 30 s when nothing changed.
     """
     global node_cache
-    await asyncio.sleep(10)  # Wait for initial setup
+    await asyncio.sleep(5)  # Wait for initial setup
 
     while True:
         if manager.active_connections:

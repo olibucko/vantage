@@ -202,8 +202,7 @@ def get_service_name(port):
 
 def query_snmp(ip, timeout=2):
     """Query SNMP for device information"""
-    # SNMP querying disabled for now - requires complex async setup
-    # TODO: Implement SNMP v2c synchronous queries using pysnmp
+    # SNMP querying not currently implemented.
     return None
 
 def detect_device_type_advanced(ip, ports, vendor, os_guess, hostname, mac=""):

@@ -8,6 +8,8 @@ import time
 import uuid
 import concurrent.futures
 
+logger = logging.getLogger("vantage.scanner")
+
 # Suppress Scapy's "MAC address to reach destination not found" warning.
 # This fires when sr1/send can't find the target in the ARP cache and falls
 # back to broadcast — harmless behaviour but noisy in the backend console.
@@ -114,10 +116,10 @@ def advanced_os_detection(ip):
                         else:
                             os_guess = "Linux"
                             confidence = 65
-        except:
+        except Exception:
             pass
 
-    except:
+    except Exception:
         pass
 
     return os_guess, confidence
@@ -276,11 +278,11 @@ def discover_onvif_devices(timeout=5):
                 ip = addr[0]
                 if ip and ip != '0.0.0.0':
                     discovered.add(ip)
-                    print(f"Vantage: ONVIF device found at {ip}")
+                    logger.info("ONVIF device found at %s", ip)
             except socket.timeout:
                 break
     except Exception as e:
-        print(f"Vantage: ONVIF discovery error: {e}")
+        logger.warning("ONVIF discovery error: %s", e)
     finally:
         if sock:
             try:
@@ -321,7 +323,7 @@ def discover_ssdp_devices(timeout=5):
             except socket.timeout:
                 break
     except Exception as e:
-        print(f"Vantage: SSDP discovery error: {e}")
+        logger.warning("SSDP discovery error: %s", e)
     finally:
         if sock:
             try:
@@ -333,7 +335,7 @@ def discover_ssdp_devices(timeout=5):
 
 def ping_sweep(subnet: str):
     """Send ICMP pings to wake up sleeping devices"""
-    print("Vantage: Sending wake-up ping sweep...")
+    logger.info("Sending wake-up ping sweep...")
 
     # Parse subnet (e.g., "192.168.20.0/24")
     base_ip = '.'.join(subnet.split('/')[0].split('.')[:-1])
@@ -341,7 +343,7 @@ def ping_sweep(subnet: str):
     def ping_host(ip):
         try:
             sr1(IP(dst=ip)/ICMP(), timeout=0.1, verbose=0)
-        except:
+        except Exception:
             pass
 
     # Ping all IPs in parallel (fast)
@@ -349,9 +351,9 @@ def ping_sweep(subnet: str):
         futures = [executor.submit(ping_host, f"{base_ip}.{i}") for i in range(1, 255)]
         concurrent.futures.wait(futures, timeout=3)
 
-    print("Vantage: Wake-up ping sweep complete")
+    logger.info("Wake-up ping sweep complete")
 
-def scan_network(target_ip: str, mdns_duration: int = 30):
+def scan_network(target_ip: str, mdns_duration: int = 30, progress_callback=None):
     """Comprehensive network scan with multi-method discovery.
 
     Runs mDNS, ONVIF WS-Discovery, SSDP and ARP concurrently so total discovery
@@ -360,11 +362,20 @@ def scan_network(target_ip: str, mdns_duration: int = 30):
     targeted ARP probes and added to the interrogation queue.
     """
 
+    def _progress(percent: int, message: str) -> None:
+        if progress_callback:
+            try:
+                progress_callback(percent, message)
+            except Exception:
+                pass
+
     # Step 1: Wake up sleeping devices with ping sweep
+    _progress(5, "Sending ping sweep…")
     ping_sweep(target_ip)
 
     # Step 2: Run all discovery protocols concurrently with the ARP sweep
-    print(f"Vantage: Starting parallel discovery (mDNS {mdns_duration}s, ONVIF, SSDP, ARP)...")
+    _progress(12, f"Starting parallel discovery (mDNS {mdns_duration}s, ONVIF, SSDP, ARP)…")
+    logger.info("Starting parallel discovery (mDNS %ds, ONVIF, SSDP, ARP)...", mdns_duration)
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as disc_pool:
         mdns_future  = disc_pool.submit(start_mdns_discovery, mdns_duration)
         onvif_future = disc_pool.submit(discover_onvif_devices, 5)
@@ -375,18 +386,20 @@ def scan_network(target_ip: str, mdns_duration: int = 30):
         ether = Ether(dst="ff:ff:ff:ff:ff:ff")
         arp_result = srp(ether/arp, timeout=3, verbose=False)[0]
         arp_devices = {received.psrc: received.hwsrc for _, received in arp_result}
-        print(f"Vantage: ARP found {len(arp_devices)} hosts")
+        logger.info("ARP found %d hosts", len(arp_devices))
+        _progress(28, f"ARP scan complete — {len(arp_devices)} host(s) found")
 
         mdns_results = mdns_future.result()
         onvif_ips    = onvif_future.result()
         ssdp_ips     = ssdp_future.result()
 
-    print(f"Vantage: mDNS={len(mdns_results)}, ONVIF={len(onvif_ips)}, SSDP={len(ssdp_ips)} discoveries")
+    logger.info("mDNS=%d, ONVIF=%d, SSDP=%d discoveries",
+                len(mdns_results), len(onvif_ips), len(ssdp_ips))
 
     # Merge ONVIF/SSDP IPs not already captured by ARP
     extra_ips = (onvif_ips | ssdp_ips) - set(arp_devices.keys())
     if extra_ips:
-        print(f"Vantage: {len(extra_ips)} extra device(s) from ONVIF/SSDP — resolving MAC...")
+        logger.info("%d extra device(s) from ONVIF/SSDP — resolving MAC...", len(extra_ips))
         for ip in extra_ips:
             try:
                 arpr = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
@@ -395,9 +408,12 @@ def scan_network(target_ip: str, mdns_duration: int = 30):
             except Exception:
                 arp_devices[ip] = "00:00:00:00:00:00"
 
-    print(f"Vantage: {len(arp_devices)} total device(s), beginning deep interrogation...")
+    total = len(arp_devices)
+    logger.info("%d total device(s), beginning deep interrogation...", total)
+    _progress(55, f"Discovery complete — interrogating {total} device(s)…")
 
     nodes = []
+    completed = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         future_to_node = {}
         for ip, mac in arp_devices.items():
@@ -419,13 +435,18 @@ def scan_network(target_ip: str, mdns_duration: int = 30):
                 node.update(interrogation_result)
                 node['hostname'] = hostname
             except Exception as e:
-                print(f"Vantage: Error interrogating {node['ip']}: {e}")
+                logger.warning("Error interrogating %s: %s", node['ip'], e)
                 node['hostname'] = "Unknown"
                 node['type'] = "Unknown Device"
                 node['os'] = "Unknown"
                 node['ports'] = []
                 node['services'] = []
                 node['confidence'] = 0
+            completed += 1
+            if total > 0:
+                pct = 55 + int(completed / total * 38)  # 55 → 93 %
+                _progress(pct, f"Interrogating devices… ({completed}/{total})")
 
-    print(f"Vantage: Scan complete. {len(nodes)} devices identified.")
+    _progress(99, "Finalising results…")
+    logger.info("Scan complete. %d devices identified.", len(nodes))
     return nodes

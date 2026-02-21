@@ -15,6 +15,7 @@ interface GraphViewProps {
   animStateRef: React.RefObject<Map<string, AnimEntry>>;
   /** IP of the gateway node — used to draw the subnet ring. */
   gatewayId: string;
+  onNodeHover?: (node: NetworkNode | null) => void;
 }
 
 // ── Device icon system ───────────────────────────────────────────────────────
@@ -58,7 +59,21 @@ function drawIcon(
   icon: IconType,
   alpha: number,
 ): void {
-  if (icon === 'none' || alpha < 0.2) return;
+  if (alpha < 0.2) return;
+
+  // Unknown device type — draw a subtle "?" so the node isn't visually empty
+  if (icon === 'none') {
+    ctx.save();
+    ctx.globalAlpha = alpha * 0.55;
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    const fs = Math.max(r * 1.05, 2.5);
+    ctx.font = `bold ${fs}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('?', x, y + fs * 0.04);
+    ctx.restore();
+    return;
+  }
 
   ctx.save();
   ctx.globalAlpha = alpha * 0.88;
@@ -228,7 +243,7 @@ function drawIcon(
 // ────────────────────────────────────────────────────────────────────────────
 
 const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(
-  { data, onNodeRightClick, onBackgroundClick, animStateRef, gatewayId },
+  { data, onNodeRightClick, onBackgroundClick, animStateRef, gatewayId, onNodeHover },
   ref
 ) {
   const fgRef = useRef<any>(null);
@@ -254,6 +269,7 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
         ref={fgRef}
         graphData={data}
         onNodeRightClick={(node, event) => onNodeRightClick(node as NetworkNode, event as unknown as MouseEvent)}
+        onNodeHover={(node) => onNodeHover?.(node ? node as NetworkNode : null)}
         onBackgroundClick={onBackgroundClick}
         nodeLabel={() => ``}
         nodeColor={(node) => (node as GraphNode).color}

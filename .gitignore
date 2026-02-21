@@ -3,4 +3,23 @@ nul
 .claude
 CLAUDE.md
 MEMORY.md
-data
+
+# Runtime data — network topology, MACs, ports, logs; never commit
+data/
+
+# Python cache & compiled bytecode
+backend/venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Backend runtime
+backend/.env
+backend/*.log
+*.log
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
