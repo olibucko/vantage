@@ -13,10 +13,12 @@ interface GraphViewProps {
   onNodeRightClick: (node: NetworkNode, event: MouseEvent) => void;
   onBackgroundClick: () => void;
   animStateRef: React.RefObject<Map<string, AnimEntry>>;
+  /** IP of the gateway node — used to draw the subnet ring. */
+  gatewayId: string;
 }
 
 const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(
-  { data, onNodeRightClick, onBackgroundClick, animStateRef },
+  { data, onNodeRightClick, onBackgroundClick, animStateRef, gatewayId },
   ref
 ) {
   const fgRef = useRef<any>(null);
@@ -53,6 +55,59 @@ const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView
           const g = node as GraphNode;
           const x = g.x ?? 0;
           const y = g.y ?? 0;
+
+          // ── Subnet Ring ────────────────────────────────────────────────────
+          // Drawn on the gateway node's canvas pass so it sits behind all other
+          // nodes (gateway is first in the nodes array, so it renders first).
+          if (g.ip === gatewayId) {
+            // Adaptive radius: max distance from gateway to any peer + padding
+            let maxDist = 80;
+            data.nodes.forEach((n: GraphNode) => {
+              if (n.id !== gatewayId && n.x != null && n.y != null) {
+                const dx = (n.x ?? 0) - x;
+                const dy = (n.y ?? 0) - y;
+                maxDist = Math.max(maxDist, Math.sqrt(dx * dx + dy * dy));
+              }
+            });
+            const ringRadius = maxDist + 40;
+
+            ctx.save();
+
+            // Faint radial fill — inner transparent, outer blue tint
+            const grad = ctx.createRadialGradient(x, y, ringRadius * 0.45, x, y, ringRadius);
+            grad.addColorStop(0, 'rgba(59,130,246,0.00)');
+            grad.addColorStop(1, 'rgba(59,130,246,0.04)');
+            ctx.beginPath();
+            ctx.arc(x, y, ringRadius, 0, 2 * Math.PI);
+            ctx.fillStyle = grad;
+            ctx.fill();
+
+            // Dashed ring border
+            ctx.beginPath();
+            ctx.arc(x, y, ringRadius, 0, 2 * Math.PI);
+            ctx.setLineDash([6 / globalScale, 4 / globalScale]);
+            ctx.strokeStyle = 'rgba(59,130,246,0.20)';
+            ctx.lineWidth = 1 / globalScale;
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Subnet label — fades in as you zoom, anchored just outside the ring
+            const subnetLabel = gatewayId.replace(/\.\d+$/, '.0/24');
+            const labelAlpha = Math.min(0.40, Math.max(0, (globalScale - 0.55) * 1.6));
+            if (labelAlpha > 0.01) {
+              const fontSize = 9 / globalScale;
+              ctx.font = `bold ${fontSize}px "JetBrains Mono", monospace`;
+              ctx.textAlign = 'center';
+              ctx.textBaseline = 'middle';
+              ctx.globalAlpha = labelAlpha;
+              ctx.fillStyle = '#3b82f6';
+              ctx.fillText(subnetLabel, x, y - ringRadius - 10 / globalScale);
+            }
+
+            ctx.restore();
+          }
+          // ──────────────────────────────────────────────────────────────────
+
           const entry = animStateRef.current?.get(g.ip);
 
           let scale = 1, alpha = 1, drawRing = false, ringT = 0;

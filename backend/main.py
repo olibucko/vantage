@@ -37,10 +37,17 @@ app.add_middleware(
 # --- Global State & Cache ---
 node_cache = []
 
+# True while a full network scan is running — prevents concurrent scans and
+# lets newly-connected WebSocket clients know they should show a loading state.
+scan_in_progress = False
+
 # Devices not seen within this window are considered disconnected.
 # Active ARP probing (every 10 s) keeps lastSeen fresh for online devices,
 # so this threshold reliably catches disconnects in ~25-35 s.
 STALE_THRESHOLD_SECONDS = 25
+
+# How long between automatic periodic re-scans (seconds).
+PERIODIC_SCAN_INTERVAL = 300  # 5 minutes
 
 def load_cache():
     global node_cache
@@ -84,7 +91,74 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# --- Core Scan Logic (shared by auto-scan, periodic scan, and manual /scan) ---
+
+async def run_scan(mdns_duration: int = 30) -> bool:
+    """Run a full network scan and push results to all WebSocket clients.
+
+    Returns True on success, False if a scan was already running or an error occurred.
+    mdns_duration controls how long mDNS discovery listens:
+      - 30 s for startup / manual scans (best coverage)
+      -  8 s for periodic background sweeps (fast enough to catch new devices)
+    """
+    global node_cache, scan_in_progress
+    if scan_in_progress:
+        print("Vantage: Scan already in progress — skipping concurrent request.")
+        return False
+
+    scan_in_progress = True
+    local_ip = get_local_ip()
+    subnet = ".".join(local_ip.split('.')[:-1]) + ".0/24"
+    print(f"Vantage: Scan starting on {subnet} (mDNS={mdns_duration}s)...")
+
+    try:
+        await manager.broadcast({"type": "SCAN_STARTED", "subnet": subnet})
+        loop = asyncio.get_event_loop()
+        nodes = await loop.run_in_executor(None, scan_network, subnet, mdns_duration)
+
+        merged_nodes = merge_with_active_scan(nodes)
+        # Refresh lastSeen so stale checker doesn't evict devices just confirmed online
+        preload_from_cache(merged_nodes)
+        node_cache = merged_nodes
+
+        with open(DATA_FILE, "w") as f:
+            json.dump(merged_nodes, f, indent=4)
+
+        await manager.broadcast({"type": "SCAN_COMPLETE", "nodes": merged_nodes})
+        print(f"Vantage: Scan complete — {len(merged_nodes)} nodes ({len(nodes)} active + passive).")
+        return True
+
+    except Exception as e:
+        print(f"Vantage: Scan error: {e}")
+        await manager.broadcast({"type": "SCAN_FAILED", "error": str(e)})
+        return False
+
+    finally:
+        scan_in_progress = False
+
 # --- Background Tasks ---
+
+async def startup_scan():
+    """Automatically run a full network scan a few seconds after startup.
+    This eliminates the need for the user to manually trigger 'Execute Sweep'
+    on first launch.
+    """
+    await asyncio.sleep(5)  # Let the passive monitor and WS server settle
+    print("Vantage: Running automatic startup scan...")
+    await run_scan(mdns_duration=30)
+
+async def periodic_discovery():
+    """Re-scan the network every PERIODIC_SCAN_INTERVAL seconds to catch
+    devices that joined after the startup scan or that don't generate ARP traffic
+    (e.g., NVRs / static-IP devices).
+    Uses a shorter mDNS window for speed; full mDNS was already done at startup.
+    """
+    # First periodic run starts after startup + startup-scan duration + interval
+    await asyncio.sleep(PERIODIC_SCAN_INTERVAL)
+    while True:
+        print("Vantage: Running periodic discovery sweep...")
+        await run_scan(mdns_duration=8)
+        await asyncio.sleep(PERIODIC_SCAN_INTERVAL)
 
 async def heartbeat():
     """Keeps WebSocket connections alive by sending a periodic pulse."""
@@ -94,22 +168,19 @@ async def heartbeat():
         await asyncio.sleep(15)
 
 async def passive_discovery_broadcast():
-    """Periodically broadcast passive discoveries to connected clients"""
+    """Periodically broadcast passive discoveries to connected clients."""
     global node_cache
     await asyncio.sleep(10)  # Wait for initial setup
 
     while True:
         passive_devices = get_passive_discoveries()
         if passive_devices and manager.active_connections:
-            # Merge with existing cache
             merged_nodes = merge_with_active_scan(node_cache)
             node_cache = merged_nodes
 
-            # Save to disk
             with open(DATA_FILE, "w") as f:
                 json.dump(merged_nodes, f, indent=4)
 
-            # Broadcast update
             await manager.broadcast({
                 "type": "PASSIVE_UPDATE",
                 "nodes": merged_nodes,
@@ -117,7 +188,7 @@ async def passive_discovery_broadcast():
             })
             print(f"Vantage: Broadcasted passive update ({len(passive_devices)} passive devices)")
 
-        await asyncio.sleep(30)  # Check every 30 seconds
+        await asyncio.sleep(30)
 
 async def broadcast_device_connected(device_info: dict):
     """Merge a newly discovered device into cache and notify all clients."""
@@ -175,7 +246,7 @@ async def device_keepalive():
 async def startup_event():
     loop = asyncio.get_running_loop()
 
-    # Bridge the sync passive_monitor callback into the async event loop
+    # Bridge the sync passive_monitor callbacks into the async event loop
     def on_device_connected(device_info: dict):
         asyncio.run_coroutine_threadsafe(broadcast_device_connected(device_info), loop)
 
@@ -189,6 +260,8 @@ async def startup_event():
     asyncio.create_task(passive_discovery_broadcast())
     asyncio.create_task(stale_device_checker())
     asyncio.create_task(device_keepalive())
+    asyncio.create_task(startup_scan())       # Full scan ~5 s after boot
+    asyncio.create_task(periodic_discovery()) # Repeat every PERIODIC_SCAN_INTERVAL
 
     start_passive_monitoring()
 
@@ -201,35 +274,11 @@ async def get_nodes():
 
 @app.get("/scan")
 async def trigger_scan():
-    """Manually triggers an active ARP sweep via Scapy."""
-    global node_cache
-    local_ip = get_local_ip()
-    subnet = ".".join(local_ip.split('.')[:-1]) + ".0/24"
-
-    print(f"Vantage: Initiating active interrogation on {subnet}...")
-
-    try:
-        loop = asyncio.get_event_loop()
-        # Offload the synchronous Scapy scan to a thread pool
-        nodes = await loop.run_in_executor(None, scan_network, subnet)
-
-        # Merge with passive discoveries
-        merged_nodes = merge_with_active_scan(nodes)
-
-        # Refresh lastSeen for all active scan results so the stale checker
-        # doesn't evict devices that were just confirmed online by the scan
-        preload_from_cache(merged_nodes)
-
-        node_cache = merged_nodes
-        with open(DATA_FILE, "w") as f:
-            json.dump(merged_nodes, f, indent=4)
-
-        await manager.broadcast({"type": "SCAN_COMPLETE", "nodes": merged_nodes})
-        print(f"Vantage: Scan complete. Identified {len(merged_nodes)} nodes ({len(nodes)} active + passive).")
-        return {"status": "success", "count": len(merged_nodes), "active": len(nodes)}
-    except Exception as e:
-        print(f"Vantage Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Manually trigger a full network scan (results delivered via WebSocket)."""
+    if scan_in_progress:
+        return {"status": "already_scanning"}
+    asyncio.create_task(run_scan(mdns_duration=30))
+    return {"status": "scan_started"}
 
 @app.post("/clear")
 async def clear_cache():
@@ -245,9 +294,15 @@ async def clear_cache():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    # If a scan is already running when this client connects, tell them immediately
+    # so the frontend can show the loading screen without waiting for the next message.
+    if scan_in_progress:
+        try:
+            await websocket.send_text(json.dumps({"type": "SCAN_STARTED"}))
+        except Exception:
+            pass
     try:
         while True:
-            # Maintain connection and listen for any client messages
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -257,5 +312,4 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    # Ensure uvicorn runs on the port specified in App.tsx
     uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -19,7 +19,7 @@ body {
 ::-webkit-scrollbar-thumb { background: #1a1a1a; border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: #3b82f6; }
 
-/* Scanning Animation */
+/* Scanning Animation — vertical sweep line on the main graph */
 @keyframes scan {
   0% {
     transform: translateY(0);
@@ -32,4 +32,17 @@ body {
     transform: translateY(100vh);
     opacity: 0;
   }
+}
+
+/* Loading screen — horizontal progress bar shuttle */
+@keyframes scanline {
+  0%   { left: -40%; }
+  100% { left: 140%; }
+}
+
+/* Loading screen — slow radar pulse (subtler than animate-ping) */
+@keyframes radar-pulse {
+  0%   { transform: scale(0.8); opacity: 0.6; }
+  70%  { transform: scale(1.8); opacity: 0; }
+  100% { transform: scale(1.8); opacity: 0; }
 }

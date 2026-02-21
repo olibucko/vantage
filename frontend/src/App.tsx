@@ -7,8 +7,8 @@ import type { NetworkNode, AnimEntry } from './types';
 function App() {
   const [nodes, setNodes] = useState<NetworkNode[]>([]);
   const [selectedNode, setSelectedNode] = useState<NetworkNode | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [filter, setFilter] = useState<string>('All');
+  // True while any full network scan is running (auto-startup, periodic, or manual)
+  const [scanning, setScanning] = useState(false);
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
   const ws = useRef<WebSocket | null>(null);
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
@@ -112,7 +112,15 @@ function App() {
           }
 
           console.log(`Vantage: Scan complete — ${scanNodes.length} live, ${removedIps.length} removed, ${addedIps.length} new`);
-          setLoading(false);
+          setScanning(false);
+
+        } else if (d.type === 'SCAN_STARTED') {
+          setScanning(true);
+          console.log("Vantage: Scan started");
+
+        } else if (d.type === 'SCAN_FAILED') {
+          setScanning(false);
+          console.warn("Vantage: Scan failed");
 
         } else if (d.type === 'PASSIVE_UPDATE') {
           // Only add genuinely new IPs — never update existing nodes here.
@@ -192,7 +200,7 @@ function App() {
     };
   }, []);
 
-  const triggerScan = () => { setLoading(true); fetch('http://localhost:8001/scan'); };
+  const triggerScan = () => { setScanning(true); fetch('http://localhost:8001/scan'); };
 
   // Use Right Click to avoid Drag competition [cite: 2026-02-20]
   const handleNodeInteraction = (node: NetworkNode, event: MouseEvent) => {
@@ -237,25 +245,40 @@ function App() {
     return node.ip;
   };
 
-  const graphData = useMemo(() => {
-    const filtered = nodes.filter(n => {
-      if (filter === 'All') return true;
-      if (filter === 'Infrastructure') return n.type.includes('Infrastructure') || n.ip.endsWith('.1');
-      if (filter === 'Workstations') return n.type.includes('Workstation') || n.type.includes('PC');
-      if (filter === 'IoT') return n.type.includes('IoT') || n.vendor === 'TP-Link';
-      return true;
-    });
+  const gatewayIp = useMemo(
+    () => nodes.find(n => n.ip.endsWith('.1'))?.ip ?? '192.168.20.1',
+    [nodes]
+  );
 
-    const gateway = nodes.find(n => n.ip.endsWith('.1')) || { 
-      ip: '192.168.20.1', hostname: 'Gateway', mac: '', vendor: 'Network', os: '', type: 'Infrastructure', ports: [] 
+  const graphData = useMemo(() => {
+    const gateway = nodes.find(n => n.ip.endsWith('.1')) || {
+      ip: '192.168.20.1', hostname: 'Gateway', mac: '', vendor: 'Network', os: '', type: 'Infrastructure', ports: []
     };
 
-    const d3Nodes = filtered.map(n => ({
+    // ── Color Engine ──────────────────────────────────────────────────────────
+    // Three-tier palette: Blue = Windows, Amber = Linux/macOS, Green = IoT/Smart
+    const IOT_TYPE_KEYWORDS = ['Camera', 'NVR', 'DVR', 'ONVIF', 'Smart Home',
+                               'Chromecast', 'Media Device', 'Printer', 'IoT'];
+    const IOT_VENDORS       = ['Nest', 'Ring', 'Belkin', 'Sonos', 'Roku',
+                               'Amazon', 'Hikvision', 'Dahua', 'Reolink',
+                               'Amcrest', 'Foscam', 'Philips Hue'];
+
+    const nodeColor = (n: NetworkNode): string => {
+      if (n.ip === gateway.ip) return '#3b82f6';                               // Gateway — anchor blue
+      if (n.os === 'Windows' || n.type?.includes('Windows')) return '#60a5fa'; // Windows — light blue
+      if (n.type?.includes('Router') || n.type?.includes('Gateway')) return '#3b82f6'; // Infra — blue
+      if (IOT_TYPE_KEYWORDS.some(kw => n.type?.includes(kw))) return '#4ade80'; // IoT — green
+      if (IOT_VENDORS.some(v => n.vendor?.includes(v))) return '#4ade80';       // IoT vendor — green
+      return '#f59e0b';                                                          // Linux/macOS/Unknown — amber
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const d3Nodes = nodes.map(n => ({
       ...n,
       id: n.ip,
       name: getDisplayName(n),
       val: n.ip === gateway.ip ? 6 : 3,
-      color: n.ip === gateway.ip ? '#3b82f6' : (n.os === 'Windows' ? '#0ea5e9' : '#f59e0b')
+      color: nodeColor(n),
     }));
 
     if (!d3Nodes.find(d => d.id === gateway.ip)) {
@@ -268,12 +291,20 @@ function App() {
         x: undefined,
         y: undefined,
         vx: undefined,
-        vy: undefined
+        vy: undefined,
       });
     }
 
-    return { nodes: d3Nodes, links: filtered.filter(n => n.ip !== gateway.ip).map(n => ({ source: gateway.ip, target: n.ip })) };
-  }, [nodes, filter]);
+    // Gateway must be first in the array so its subnet ring renders behind all nodes
+    const gatewayNode    = d3Nodes.find(n => n.id === gateway.ip);
+    const nonGatewayNodes = d3Nodes.filter(n => n.id !== gateway.ip);
+    const orderedNodes   = gatewayNode ? [gatewayNode, ...nonGatewayNodes] : d3Nodes;
+
+    return {
+      nodes: orderedNodes,
+      links: nodes.filter(n => n.ip !== gateway.ip).map(n => ({ source: gateway.ip, target: n.ip })),
+    };
+  }, [nodes]);
 
   return (
     <div className="flex flex-col h-screen w-screen bg-[#020202] text-neutral-100 font-sans overflow-hidden">
@@ -290,14 +321,9 @@ function App() {
         </div>
 
         <div className="flex items-center gap-8">
-          <nav className="flex bg-white/5 rounded-full p-1.5 border border-white/20 shadow-inner">
-            {['All', 'Infrastructure', 'Workstations', 'IoT'].map(f => (
-              <button key={f} onClick={() => setFilter(f)} className={`px-5 py-2 rounded-full text-[11px] font-black uppercase tracking-widest transition-all cursor-pointer ${filter === f ? 'bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.2)]' : 'text-neutral-500 hover:text-white'}`}>{f}</button>
-            ))}
-          </nav>
-          <button onClick={triggerScan} disabled={loading} className="group flex items-center gap-3 px-8 py-3 rounded-full bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-50 transition-all font-black text-xs uppercase tracking-widest shadow-[0_0_30px_rgba(37,99,235,0.3)]">
-            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-            {loading ? 'Interrogating' : 'Execute Sweep'}
+          <button onClick={triggerScan} disabled={scanning} className="group flex items-center gap-3 px-8 py-3 rounded-full bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-50 transition-all font-black text-xs uppercase tracking-widest shadow-[0_0_30px_rgba(37,99,235,0.3)]">
+            <RefreshCw className={`w-4 h-4 ${scanning ? 'animate-spin' : ''}`} />
+            {scanning ? 'Scanning...' : 'Execute Sweep'}
           </button>
         </div>
       </header>
@@ -320,8 +346,8 @@ function App() {
           }}
         />
 
-        {/* Scanning Animation Overlay */}
-        {loading && (
+        {/* Scanning Animation Overlay (subtle, shown when nodes already visible) */}
+        {scanning && nodes.length > 0 && (
           <div className="absolute inset-0 pointer-events-none -z-5">
             <div className="absolute inset-0 bg-gradient-to-b from-transparent via-blue-500/10 to-transparent animate-pulse" />
             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-blue-500 to-transparent animate-[scan_2s_ease-in-out_infinite]"
@@ -347,13 +373,73 @@ function App() {
           </div>
         )}
         
-        <GraphView ref={graphRef} data={graphData} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} animStateRef={animStateRef} />
+        {/* ── Initial Loading Screen ─────────────────────────────────────────
+             Shown only when a scan is running AND no nodes are visible yet.
+             Once nodes exist (from cache or first SCAN_COMPLETE) this unmounts
+             and the graph takes over. ──────────────────────────────────────── */}
+        {scanning && nodes.length === 0 && (
+          <div className="absolute inset-0 z-50 flex flex-col items-center justify-center">
+            {/* Background — matches the app shell */}
+            <div className="absolute inset-0 bg-[#020202]" />
+            <div className="absolute inset-0 opacity-25 pointer-events-none" style={{
+              backgroundImage: 'radial-gradient(#2a2a2a 1.5px, transparent 1.5px)',
+              backgroundSize: '40px 40px'
+            }} />
+            <div className="absolute inset-0 pointer-events-none" style={{
+              backgroundImage: 'radial-gradient(circle at 50% 50%, rgba(37,99,235,0.13) 0%, transparent 60%)'
+            }} />
+
+            <div className="relative z-10 flex flex-col items-center gap-10">
+              {/* Radar rings */}
+              <div className="relative w-44 h-44 flex items-center justify-center">
+                {[0, 1, 2].map(i => (
+                  <div
+                    key={i}
+                    className="absolute inset-0 rounded-full border border-blue-500/25"
+                    style={{ animation: `radar-pulse 2.4s ease-out ${i * 0.8}s infinite` }}
+                  />
+                ))}
+                {/* Static outer ring */}
+                <div className="absolute inset-0 rounded-full border border-blue-500/10" />
+                {/* Centre icon */}
+                <div className="relative p-5 bg-blue-600/10 rounded-full border border-blue-500/20 shadow-[0_0_40px_rgba(59,130,246,0.25)]">
+                  <Shield className="w-12 h-12 text-blue-500 drop-shadow-[0_0_12px_rgba(59,130,246,0.8)]" />
+                </div>
+              </div>
+
+              {/* Text */}
+              <div className="text-center space-y-3">
+                <h2 className="text-2xl font-black tracking-[0.45em] uppercase text-white">
+                  Scanning Network
+                </h2>
+                <p className="text-[11px] font-mono tracking-[0.22em] uppercase text-blue-400/55">
+                  ARP Sweep&nbsp;·&nbsp;mDNS&nbsp;·&nbsp;ONVIF&nbsp;·&nbsp;SSDP&nbsp;·&nbsp;Deep Interrogation
+                </p>
+              </div>
+
+              {/* Shuttle progress bar */}
+              <div className="w-72 h-px bg-white/10 relative overflow-hidden rounded-full">
+                <div
+                  className="absolute inset-y-0 w-2/5 bg-gradient-to-r from-transparent via-blue-500 to-transparent"
+                  style={{ animation: 'scanline 1.8s ease-in-out infinite' }}
+                />
+              </div>
+
+              <p className="text-[10px] font-mono tracking-widest text-neutral-600 uppercase">
+                This may take ~30 seconds on first run
+              </p>
+            </div>
+          </div>
+        )}
+
+        <GraphView ref={graphRef} data={graphData} gatewayId={gatewayIp} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} animStateRef={animStateRef} />
         
-        {/* Tactical Legend [cite: 2026-02-20] */}
+        {/* Tactical Legend — Color Engine [cite: 2026-02-20] */}
         <div className="absolute top-10 left-10 p-6 bg-black/80 border border-white/25 rounded-2xl backdrop-blur-2xl flex flex-col gap-4 pointer-events-none z-20 shadow-2xl">
-          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_10px_#3b82f6]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">Core Network</span></div>
-          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-[#0ea5e9] shadow-[0_0_10px_#0ea5e9]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">Windows Node</span></div>
-          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-[#f59e0b] shadow-[0_0_10px_#f59e0b]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">Unix / Apple</span></div>
+          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-[#3b82f6] shadow-[0_0_10px_#3b82f6]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">Core Network</span></div>
+          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-[#60a5fa] shadow-[0_0_10px_#60a5fa]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">Windows</span></div>
+          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-[#f59e0b] shadow-[0_0_10px_#f59e0b]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">Linux / macOS</span></div>
+          <div className="flex items-center gap-4"><div className="w-2.5 h-2.5 rounded-full bg-[#4ade80] shadow-[0_0_10px_#4ade80]" /> <span className="text-[11px] uppercase tracking-widest font-black text-neutral-400">IoT / Smart</span></div>
         </div>
 
         {/* Device Information Panel */}
