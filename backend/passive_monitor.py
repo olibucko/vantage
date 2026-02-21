@@ -10,12 +10,17 @@ devices_lock = threading.Lock()
 monitoring_active = False
 monitor_thread = None
 
-# Connect callback (set by main.py to fire DEVICE_CONNECTED events)
+# Callbacks registered by main.py to bridge sync threads → async event loop
 _on_connect_callback = None
+_on_update_callback = None
 
 def set_on_connect_callback(callback):
     global _on_connect_callback
     _on_connect_callback = callback
+
+def set_on_update_callback(callback):
+    global _on_update_callback
+    _on_update_callback = callback
 
 def get_stale_devices(threshold_seconds: int) -> list:
     """Return copies of devices not seen within threshold_seconds."""
@@ -120,15 +125,26 @@ def passive_arp_callback(packet):
                     ).start()
 
 def interrogate_new_device(ip, mac, vendor):
-    """Deep interrogation for passively discovered device"""
+    """Deep interrogation for a newly discovered device.
+    On completion, fires _on_update_callback so main.py can push
+    the enriched node data to all connected WebSocket clients.
+    """
     try:
         info, hostname = deep_interrogate(ip, vendor, mac)
 
+        snapshot = None
         with devices_lock:
             if ip in discovered_devices:
                 discovered_devices[ip].update(info)
                 discovered_devices[ip]['hostname'] = hostname
-                print(f"Vantage: Passive discovery complete for {ip}: {info.get('type', 'Unknown')}")
+                snapshot = discovered_devices[ip].copy()
+                print(f"Vantage: Interrogation complete for {ip}: {info.get('type', 'Unknown')}")
+
+        if snapshot and _on_update_callback:
+            try:
+                _on_update_callback(snapshot)
+            except Exception as e:
+                print(f"Vantage: on_update_callback error: {e}")
     except Exception as e:
         print(f"Vantage: Error interrogating passive device {ip}: {e}")
 

@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import GraphView from './GraphView';
+import type { GraphViewHandle } from './GraphView';
 import { Shield, RefreshCw, Activity, X, Wifi, Monitor, Cpu, HardDrive, Lock, Unlock } from 'lucide-react';
 import type { NetworkNode, AnimEntry } from './types';
 
@@ -14,6 +15,7 @@ function App() {
   const animStateRef = useRef<Map<string, AnimEntry>>(new Map());
   // Mirror of `nodes` state for synchronous reads inside WS callbacks (avoids stale closures)
   const nodesRef = useRef<NetworkNode[]>([]);
+  const graphRef = useRef<GraphViewHandle>(null);
 
   useEffect(() => {
     const loadCache = async () => {
@@ -101,6 +103,14 @@ function App() {
             }, 950);
           });
 
+          // Place new nodes at the gateway so they emerge from the centre
+          if (addedIps.length > 0) {
+            const gatewayIp = prev.find(n => n.ip.endsWith('.1'))?.ip ?? scanNodes.find((n: NetworkNode) => n.ip.endsWith('.1'))?.ip ?? '';
+            requestAnimationFrame(() => {
+              addedIps.forEach(ip => graphRef.current?.initNodeAtGateway(ip, gatewayIp));
+            });
+          }
+
           console.log(`Vantage: Scan complete — ${scanNodes.length} live, ${removedIps.length} removed, ${addedIps.length} new`);
           setLoading(false);
 
@@ -127,8 +137,11 @@ function App() {
               if (animStateRef.current.get(newNode.ip)?.type === 'spawn')
                 animStateRef.current.delete(newNode.ip);
             }, 950);
+            const gatewayIp = nodesRef.current.find(n => n.ip.endsWith('.1'))?.ip ?? '';
             nodesRef.current = [...nodesRef.current, newNode];
             setNodes([...nodesRef.current]);
+            // Place at gateway position after React has committed + ForceGraph2D has processed
+            requestAnimationFrame(() => graphRef.current?.initNodeAtGateway(newNode.ip, gatewayIp));
             console.log(`Vantage: Device connected — ${newNode.ip}`);
           }
 
@@ -141,6 +154,14 @@ function App() {
             setNodes([...nodesRef.current]);
             animStateRef.current.delete(ip);
           }, 900);
+
+        } else if (d.type === 'DEVICE_UPDATED') {
+          const updated: NetworkNode = d.node;
+          if (nodesRef.current.some(n => n.ip === updated.ip)) {
+            nodesRef.current = nodesRef.current.map(n => n.ip === updated.ip ? { ...n, ...updated } : n);
+            setNodes([...nodesRef.current]);
+            console.log(`Vantage: Device updated — ${updated.ip} (${updated.type})`);
+          }
 
         } else if (d.type === 'HEARTBEAT') {
           // silent
@@ -326,7 +347,7 @@ function App() {
           </div>
         )}
         
-        <GraphView data={graphData} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} animStateRef={animStateRef} />
+        <GraphView ref={graphRef} data={graphData} onNodeRightClick={handleNodeInteraction} onBackgroundClick={() => setSelectedNode(null)} animStateRef={animStateRef} />
         
         {/* Tactical Legend [cite: 2026-02-20] */}
         <div className="absolute top-10 left-10 p-6 bg-black/80 border border-white/25 rounded-2xl backdrop-blur-2xl flex flex-col gap-4 pointer-events-none z-20 shadow-2xl">

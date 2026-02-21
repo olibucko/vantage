@@ -1,6 +1,12 @@
-import React from 'react';
+import React, { useRef, useImperativeHandle, forwardRef } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { NetworkNode, GraphNode, GraphData, AnimEntry } from './types';
+
+export interface GraphViewHandle {
+  /** Place a newly-added node at the gateway's current position so it
+   *  emerges from the centre rather than teleporting in from a random location. */
+  initNodeAtGateway(nodeId: string, gatewayId: string): void;
+}
 
 interface GraphViewProps {
   data: GraphData;
@@ -9,10 +15,33 @@ interface GraphViewProps {
   animStateRef: React.RefObject<Map<string, AnimEntry>>;
 }
 
-export default function GraphView({ data, onNodeRightClick, onBackgroundClick, animStateRef }: GraphViewProps) {
+const GraphView = forwardRef<GraphViewHandle, GraphViewProps>(function GraphView(
+  { data, onNodeRightClick, onBackgroundClick, animStateRef },
+  ref
+) {
+  const fgRef = useRef<any>(null);
+
+  useImperativeHandle(ref, () => ({
+    initNodeAtGateway(nodeId: string, gatewayId: string) {
+      const nodes = fgRef.current?.getGraphData()?.nodes as any[] | undefined;
+      if (!nodes) return;
+      const gw     = nodes.find(n => n.id === gatewayId);
+      const target = nodes.find(n => n.id === nodeId);
+      if (target) {
+        // Seed position at gateway so the physics simulation moves it
+        // outward naturally instead of dropping it at a random far location
+        target.x  = gw?.x  ?? 0;
+        target.y  = gw?.y  ?? 0;
+        target.vx = 0;
+        target.vy = 0;
+      }
+    }
+  }));
+
   return (
     <div className="w-full h-full min-h-0 min-w-0 overflow-hidden cursor-crosshair">
       <ForceGraph2D
+        ref={fgRef}
         graphData={data}
         // Using onNodeRightClick to avoid Drag competition [cite: 2026-02-20]
         onNodeRightClick={(node, event) => onNodeRightClick(node as NetworkNode, event as unknown as MouseEvent)}
@@ -149,8 +178,13 @@ export default function GraphView({ data, onNodeRightClick, onBackgroundClick, a
         linkDirectionalParticleSpeed={0.006}
         linkDirectionalParticleWidth={2}
         backgroundColor="rgba(0,0,0,0)"
+        // Higher alpha decay → simulation settles in ~2 s instead of the default ~5 s,
+        // so the graph stabilises quickly after each node addition/removal.
+        d3AlphaDecay={0.04}
         d3VelocityDecay={0.45}
       />
     </div>
   );
-}
+});
+
+export default GraphView;

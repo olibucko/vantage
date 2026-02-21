@@ -12,8 +12,8 @@ from passive_monitor import (
     start_passive_monitoring, stop_passive_monitoring,
     get_passive_discoveries, merge_with_active_scan,
     clear_passive_discoveries, set_on_connect_callback,
-    get_stale_devices, remove_device, preload_from_cache,
-    probe_known_devices
+    set_on_update_callback, get_stale_devices,
+    remove_device, preload_from_cache, probe_known_devices
 )
 
 # --- Environment Setup ---
@@ -129,6 +129,18 @@ async def broadcast_device_connected(device_info: dict):
         await manager.broadcast({"type": "DEVICE_CONNECTED", "node": device_info})
         print(f"Vantage: Broadcasted DEVICE_CONNECTED for {ip}")
 
+async def broadcast_device_updated(device_info: dict):
+    """Push enriched device data to all clients after deep interrogation completes."""
+    global node_cache
+    ip = device_info.get('ip')
+    if ip:
+        node_cache = [device_info if n.get('ip') == ip else n for n in node_cache]
+        with open(DATA_FILE, "w") as f:
+            json.dump(node_cache, f, indent=4)
+    if manager.active_connections:
+        await manager.broadcast({"type": "DEVICE_UPDATED", "node": device_info})
+        print(f"Vantage: Broadcasted DEVICE_UPDATED for {ip} ({device_info.get('type', 'Unknown')})")
+
 async def stale_device_checker():
     """Periodically evict devices that haven't been seen recently."""
     global node_cache
@@ -167,7 +179,11 @@ async def startup_event():
     def on_device_connected(device_info: dict):
         asyncio.run_coroutine_threadsafe(broadcast_device_connected(device_info), loop)
 
+    def on_device_updated(device_info: dict):
+        asyncio.run_coroutine_threadsafe(broadcast_device_updated(device_info), loop)
+
     set_on_connect_callback(on_device_connected)
+    set_on_update_callback(on_device_updated)
 
     asyncio.create_task(heartbeat())
     asyncio.create_task(passive_discovery_broadcast())
