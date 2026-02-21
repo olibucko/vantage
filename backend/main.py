@@ -62,6 +62,7 @@ def load_cache():
 
 load_cache()
 preload_from_cache(node_cache)  # Seed passive monitor so stale checker can track cached devices
+node_cache = []                 # Don't serve stale cache to the frontend — startup scan populates it
 
 # --- Cache Persistence Helpers ---
 

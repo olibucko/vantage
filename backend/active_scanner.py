@@ -59,25 +59,30 @@ def advanced_os_detection(ip):
                 os_guess = "Network Device"
                 confidence = 50
 
-        # TCP SYN for window size analysis
+        # TCP SYN for window size analysis.
+        # We must check SYN-ACK responses only — a RST (sent when the port is
+        # closed) always carries window=0 regardless of OS, so using it would
+        # misidentify any device with port 80 blocked/closed as Linux.
         try:
             tcp_pkt = sr1(IP(dst=ip)/TCP(dport=80, flags="S"), timeout=1, verbose=0)
             if tcp_pkt and tcp_pkt.haslayer(TCP):
-                window = tcp_pkt[TCP].window
-
-                # Windows typically has larger windows
-                if window >= 64000:
-                    if os_guess == "Windows":
-                        confidence = 85
-                    else:
-                        os_guess = "Windows"
-                        confidence = 70
-                elif window <= 5840:  # Common Linux default
-                    if "Linux" in os_guess:
-                        confidence = 80
-                    else:
-                        os_guess = "Linux"
-                        confidence = 65
+                flags = tcp_pkt[TCP].flags
+                is_synack = (int(flags) & 0x12) == 0x12  # SYN(0x02) + ACK(0x10)
+                if is_synack:
+                    window = tcp_pkt[TCP].window
+                    # Windows typically has larger initial receive windows
+                    if window >= 64000:
+                        if os_guess == "Windows":
+                            confidence = 85
+                        else:
+                            os_guess = "Windows"
+                            confidence = 70
+                    elif window <= 5840:  # Common Linux default
+                        if "Linux" in os_guess:
+                            confidence = 80
+                        else:
+                            os_guess = "Linux"
+                            confidence = 65
         except:
             pass
 
