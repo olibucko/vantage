@@ -1,0 +1,11 @@
+fastapi==0.129.0
+uvicorn[standard]==0.41.0
+scapy==2.7.0
+zeroconf==0.148.0
+python-dotenv==1.2.1
+pydantic==2.12.5
+websockets==16.0
+starlette==0.52.1
+anyio==4.12.1
+h11==0.16.0
+idna==3.11
