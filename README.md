@@ -2,6 +2,8 @@
 
 A local-network discovery and visualisation tool. Performs active ARP sweeps, passive ARP monitoring, mDNS/ONVIF/SSDP discovery, and OS/port fingerprinting — then displays results as a live force-directed graph.
 
+![Vantage demo](vantage_demo_gif.gif)
+
 ---
 
 ## Requirements
